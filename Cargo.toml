@@ -1,8 +1,10 @@
 [package]
 name = "drive2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "DRIVE GAME2 (MSX・FAN ファンダム掲載 / HASEMAKO) の Rust 移植"
+license = "MIT"
 
 [dependencies]
-crossterm = "0.29.0"
-rand = "0.9.2"
+macroquad = { version = "0.4", default-features = false }
+tinyaudio = "2"
