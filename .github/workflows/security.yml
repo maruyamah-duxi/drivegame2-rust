@@ -26,7 +26,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: security-${{ github.ref }}
+  # 週次の履歴全体スキャンが main への push で打ち切られないよう、イベント種別ごとに分ける
+  group: security-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
