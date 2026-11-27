@@ -82,14 +82,59 @@ jobs:
             gitleaks git --redact --verbose
           fi
 
-      # 既存の依存に残っている脆弱性で全 PR が赤くならないよう、PR では警告だけにする。
-      # main への push と週次の定期実行では失敗させる。
+      # PR では「この PR で新しく増えた脆弱性」だけで失敗させる（既存の脆弱性では止めない）。
+      # main への push と週次の定期実行では、残っている脆弱性があれば失敗させる。
       - name: osv-scanner
-        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          set +e
-          osv-scanner scan source -r .
-          rc=$?
-          # 128 = スキャン対象（ロックファイル等）が見つからない
-          if [ "$rc" -eq 128 ]; then echo "ロックファイルが無いためスキップ"; exit 0; fi
-          exit "$rc"
+          set -uo pipefail
+          # 終了コード: 0 = 脆弱性なし / 1 = 脆弱性あり / 128 = スキャン対象（ロックファイル等）なし / それ以外 = エラー
+          scan() {
+            osv-scanner scan source -r --format json "$1" > "$2"
+            local rc=$?
+            case "$rc" in
+              0|1) ;;
+              128) echo '{"results":[]}' > "$2" ;;
+              *) echo "::error::osv-scanner が失敗しました（終了コード $rc）"; exit "$rc" ;;
+            esac
+          }
+
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            osv-scanner scan source -r .
+            rc=$?
+            if [ "$rc" -eq 128 ]; then echo "ロックファイルが無いためスキップ"; exit 0; fi
+            exit "$rc"
+          fi
+
+          command -v python3 >/dev/null || { echo "::error::ランナーに python3 がありません"; exit 1; }
+          scan . "$RUNNER_TEMP/osv-head.json"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA" >/dev/null
+          scan "$RUNNER_TEMP/base" "$RUNNER_TEMP/osv-base.json"
+
+          python3 - "$RUNNER_TEMP/osv-base.json" "$RUNNER_TEMP/osv-head.json" <<'PY'
+          import json, sys
+
+          def vulns(path):
+              found = {}
+              for result in json.load(open(path)).get("results") or []:
+                  for pkg in result.get("packages") or []:
+                      p = pkg.get("package", {})
+                      for v in pkg.get("vulnerabilities") or []:
+                          key = (p.get("ecosystem", ""), p.get("name", ""), v.get("id", ""))
+                          found[key] = p.get("version", "")
+              return found
+
+          base, head = vulns(sys.argv[1]), vulns(sys.argv[2])
+          new = sorted(set(head) - set(base))
+          fixed = len(set(base) - set(head))
+          print(f"既存の脆弱性: {len(set(head) & set(base))} 件（この PR では止めない） / この PR で解消: {fixed} 件")
+          if not new:
+              print("この PR で新しく増えた脆弱性はありません")
+              sys.exit(0)
+          print(f"::error::この PR で新しく増えた脆弱性: {len(new)} 件")
+          for eco, name, vid in new:
+              print(f"  {eco} {name}@{head[(eco, name, vid)]}  {vid}  https://osv.dev/vulnerability/{vid}")
+          sys.exit(1)
+          PY
