@@ -1,0 +1,51 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 18 * * 0"   # 毎週月曜 03:17 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: [self-hosted, macOS]   # Mac mini のランナーラベルに合わせる
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check tools
+        run: |
+          for t in gitleaks semgrep osv-scanner; do
+            command -v "$t" >/dev/null || { echo "::error::$t が runner にありません"; exit 1; }
+          done
+
+      - name: gitleaks
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            gitleaks git --redact --verbose \
+              --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            gitleaks git --redact --verbose
+          fi
+
+      - name: osv-scanner
+        run: osv-scanner scan source -r .
+
+      - name: semgrep
+        continue-on-error: true   # 誤検知を潰したら削除（Step7）
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          semgrep scan --config p/default --config p/secrets --error \
+            --exclude vendor --exclude node_modules --exclude wp-includes --exclude wp-admin

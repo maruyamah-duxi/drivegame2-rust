@@ -1,0 +1,7 @@
+# GHAS push protection の代わり。brew / scoop で入れた gitleaks を使う
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks-system
+        pass_filenames: false   # ファイル名を渡さない（gitleaks git は引数を1つしか取らない）
