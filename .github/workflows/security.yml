@@ -1,11 +1,25 @@
-name: security
+# シークレット・依存脆弱性のスキャン（GHAS 解約後の代替）。
+#
+# * gitleaks    … コミット履歴へのシークレット混入（GHAS secret scanning の代わり）。
+#                 除外設定はリポジトリ直下の .gitleaks.toml（あれば）
+# * osv-scanner … ロックファイルの既知脆弱性。ロックファイルが無ければ何もしない
+#
+# ツールは版と SHA-256 を固定した公式リリースバイナリをジョブ内で取得する
+# （arm64 / x64 どちらのランナーでも同じ版で動かすため）。版を上げるときは
+# 公式の checksums ファイルから値を差し替える。
+# Semgrep（SAST）は公式イメージを digest 固定で入れる方針のため別 PR で追加する。
+#
+# 公開リポジトリなので GitHub ホストランナー（無料）で動かす。セルフホストランナーは
+# フォークからの PR で任意コードを実行されうるため使わない。secrets 不使用・contents: read のみ。
+name: Security scan
 
 on:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
   schedule:
-    - cron: "17 18 * * 0"   # 毎週月曜 03:17 JST
+    - cron: "17 18 * * 0"   # 毎週月曜 03:17 JST に履歴全体を検査
   workflow_dispatch:
 
 permissions:
@@ -15,37 +29,66 @@ concurrency:
   group: security-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  GITLEAKS_SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+  OSV_VERSION: 2.7.1
+  OSV_SHA256_AMD64: fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
+  OSV_SHA256_ARM64: 983d22fbad9724514e3fcc6acc83b5fa64c5ffa6b0d9f510028f22c1b223ff81
+
 jobs:
   scan:
-    runs-on: [self-hosted, macOS]   # Mac mini のランナーラベルに合わせる
-    timeout-minutes: 30
+    name: gitleaks / osv-scanner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # gitleaks が履歴を見るため
 
-      - name: Check tools
+      - name: Install tools (pinned + checksum)
         run: |
-          for t in gitleaks semgrep osv-scanner; do
-            command -v "$t" >/dev/null || { echo "::error::$t が runner にありません"; exit 1; }
-          done
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/bin"; mkdir -p "$BIN"; cd "$RUNNER_TEMP"
+          case "$(uname -m)" in
+            x86_64)        GL_ARCH=x64;   GL_SHA=$GITLEAKS_SHA256_X64;   OSV_ARCH=amd64; OSV_SHA=$OSV_SHA256_AMD64 ;;
+            aarch64|arm64) GL_ARCH=arm64; GL_SHA=$GITLEAKS_SHA256_ARM64; OSV_ARCH=arm64; OSV_SHA=$OSV_SHA256_ARM64 ;;
+            *) echo "::error::未対応のアーキテクチャ $(uname -m)"; exit 1 ;;
+          esac
+
+          GL_TGZ="gitleaks_${GITLEAKS_VERSION}_linux_${GL_ARCH}.tar.gz"
+          curl -fsSLo "$GL_TGZ" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${GL_TGZ}"
+          echo "${GL_SHA}  ${GL_TGZ}" | sha256sum -c -
+          tar -xzf "$GL_TGZ" -C "$BIN" gitleaks
+
+          OSV_BIN="osv-scanner_linux_${OSV_ARCH}"
+          curl -fsSLo "$OSV_BIN" "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/${OSV_BIN}"
+          echo "${OSV_SHA}  ${OSV_BIN}" | sha256sum -c -
+          install -m 0755 "$OSV_BIN" "$BIN/osv-scanner"
+
+          echo "$BIN" >> "$GITHUB_PATH"
 
       - name: gitleaks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            gitleaks git --redact --verbose \
-              --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            gitleaks git --redact --verbose --log-opts="${BASE_SHA}..${HEAD_SHA}"
           else
             gitleaks git --redact --verbose
           fi
 
+      # 既存の依存に残っている脆弱性で全 PR が赤くならないよう、PR では警告だけにする。
+      # main への push と週次の定期実行では失敗させる。
       - name: osv-scanner
-        run: osv-scanner scan source -r .
-
-      - name: semgrep
-        continue-on-error: true   # 誤検知を潰したら削除（Step7）
-        env:
-          SEMGREP_SEND_METRICS: "off"
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
-          semgrep scan --config p/default --config p/secrets --error \
-            --exclude vendor --exclude node_modules --exclude wp-includes --exclude wp-admin
+          set +e
+          osv-scanner scan source -r .
+          rc=$?
+          # 128 = スキャン対象（ロックファイル等）が見つからない
+          if [ "$rc" -eq 128 ]; then echo "ロックファイルが無いためスキップ"; exit 0; fi
+          exit "$rc"
