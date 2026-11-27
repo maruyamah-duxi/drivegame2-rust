@@ -110,8 +110,13 @@ jobs:
 
           command -v python3 >/dev/null || { echo "::error::ランナーに python3 がありません"; exit 1; }
           scan . "$RUNNER_TEMP/osv-head.json"
-          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA" >/dev/null
-          scan "$RUNNER_TEMP/base" "$RUNNER_TEMP/osv-base.json"
+          # 変更前（base）の状態を別ディレクトリに取り出して同じようにスキャンする。
+          # ランナーは作業ディレクトリを使い回すので、前回の登録を掃除してから作り、終わったら消す。
+          BASE_DIR="$RUNNER_TEMP/osv-base-$GITHUB_RUN_ID"
+          git worktree prune
+          git worktree add --force --detach "$BASE_DIR" "$BASE_SHA" >/dev/null || { echo "::error::base（$BASE_SHA）を取り出せませんでした"; exit 1; }
+          trap 'git worktree remove --force "$BASE_DIR" >/dev/null 2>&1; git worktree prune' EXIT
+          scan "$BASE_DIR" "$RUNNER_TEMP/osv-base.json"
 
           python3 - "$RUNNER_TEMP/osv-base.json" "$RUNNER_TEMP/osv-head.json" <<'PY'
           import json, sys
