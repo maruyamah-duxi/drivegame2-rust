@@ -1,0 +1,35 @@
+# dependabot の設定
+version: 2
+
+updates:
+  # ワークフローの外部 Action は commit SHA で固定する。dependabot が新しい版の SHA と
+  # 版コメントをまとめて直した PR を週1回出す。公開から3日以内の版は採用しない（cooldown）。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    cooldown:
+      default-days: 3
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+
+  # Rust の依存。定期の版上げ PR は出さず、脆弱性修正（security update）の PR だけ出す。
+  # リポジトリ設定で Dependabot security updates を有効にしておくこと。
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: chore
