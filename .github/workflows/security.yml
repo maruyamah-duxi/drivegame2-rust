@@ -89,7 +89,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail   # 終了コードを自分で判定するため -e を外す
           # 終了コード: 0 = 脆弱性なし / 1 = 脆弱性あり / 128 = スキャン対象（ロックファイル等）なし / それ以外 = エラー
           scan() {
             osv-scanner scan source -r --format json "$1" > "$2"
