@@ -16,7 +16,9 @@
 # 限界: eval や別スクリプトの中で実行される git は追えない（git と commit / push の文字が
 #       コマンド中にあれば、作業ディレクトリでの commit / push として検査はする）。
 #       別名でコピーした git の実行ファイル（cp /usr/bin/git /tmp/vcs など）も追えない
-#       （最後の砦は CI の security.yml）。git のエイリアスは展開して追い、! で始まるシェルの
+#       （最後の砦は CI の security.yml）。フックはコマンドの実行前に一度だけ動くので、同じコマンドの中で
+#       commit より前にファイルを書き換える文があると書き換え後の内容を検査できない。その場合は止めて、
+#       書き換えと commit を分けて実行してもらう。git のエイリアスは展開して追い、! で始まるシェルの
 #       エイリアスは中身を追えないので止める。
 # また、フックと検査設定（.claude ディレクトリ全体、.gitleaks.toml、.gitleaksignore）に触れるコマンドは、
 # 読むだけと分かるもの以外は確認を求める（settings.json の ask は Edit ツールにしか効かないため）。
@@ -209,11 +211,13 @@ READONLY = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg
             "diff", "cmp", "uniq", "cut", "tr", "jq", "echo", "printf", "pwd", "cd", "pushd", "popd",
             "true", "false", "test", "[", "which", "type", "shellcheck", "md5sum", "sha256sum", "shasum",
             "basename", "dirname", "realpath", "readlink", "nl", "column", "tree", "du", "df", "date"}
-GIT_READONLY = {"diff", "show", "log", "status", "blame", "ls-files", "ls-tree", "grep", "add", "commit", "push",
+GIT_READONLY = {"diff", "show", "log", "status", "blame", "ls-files", "ls-tree", "grep", "add", "commit", "push", "init",
                 "fetch", "rev-parse", "rev-list", "cat-file", "describe", "shortlog", "branch", "remote", "tag"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 readonly_ok = [True]
+wrote = [False]
+NON_WRITE = {"export", "unset", "declare", "typeset", "local", "readonly", "mkdir", "cd", "pushd", "popd", "set"}
 touches = [False]
 
 PROTECTED_NAMES = (".claude", ".gitleaks.toml", ".gitleaksignore")
@@ -407,10 +411,22 @@ def parse(text, start=None):
 def segment(seg, here):
     # export GIT_DIR=... / declare -x ... / typeset -x ... / unset GIT_DIR は以降の文に効く
     # if / while / { などの予約語は読み飛ばす（{ cd x; } の cd は実際に効く）
-    while seg and seg[0] in ("{", "}", "!", "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "time"):
+    # command cd / builtin cd も cd として扱う（command -v は調べるだけ）
+    while seg and seg[0] in ("{", "}", "!", "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "time",
+                             "command", "builtin"):
+        if seg[0] == "command" and seg[1:2] in (["-v"], ["-V"]):
+            return here
         seg = seg[1:]
+        while seg and seg[0] == "-p":
+            seg = seg[1:]
     if not seg:
         return here
+    # 同じコマンドの中で、commit より前にファイルを書き換えうる文があるか（フックは実行前に一度だけ
+    # 動くので、後から書き込まれる内容は検査できない）。シェルの -c は中身を別に解析する
+    # git の文は下でサブコマンドを見て判断する（コミットメッセージの "$(cat …)" を書き込みと取り違えない）
+    if os.path.basename(seg[0]) != "git" and not check_readonly(seg) and seg[0] not in NON_WRITE \
+            and not (os.path.basename(seg[0]) in SHELLS and "-c" in seg[1:-1]):
+        wrote[0] = True
     if not check_readonly(seg):
         readonly_ok[0] = False
     # フックや検査設定に触れるか。引用符で分けた名前（.cla""ude）も字句に分けた後なら見える。
@@ -566,6 +582,14 @@ def segment(seg, here):
         readonly_ok[0] = False
     if PROTECTED.search(" ".join(seg)):
         touches[0] = True
+    if sub not in GIT_READONLY:
+        wrote[0] = True   # checkout / stash pop などは作業ツリーを書き換える
+    # パスを書かずに作業ツリー全体を書き換える操作は、フックや検査設定も書き換えうる
+    if sub == "clean" \
+            or (sub == "reset" and any(a in ("--hard", "--merge", "--keep") for a in rest_args)) \
+            or (sub == "stash" and rest_args[:1] in (["pop"], ["apply"])) \
+            or (sub in ("checkout", "restore", "switch") and any(a in (".", ":/", "-f", "--force") for a in rest_args)):
+        touches[0] = True
     if sub == "add":
         # git add -f / --force は .gitignore に一致するファイルも足す。フックの時点ではまだ実行前なので、
         # 検査用の一時インデックスにも同じファイルを -f で足す（.env を -f で取り込むのを見逃さない）
@@ -594,6 +618,9 @@ def segment(seg, here):
         d2 = d if wt_opt_given else (resolve(c, e2["GIT_WORK_TREE"], e2) if e2.get("GIT_WORK_TREE") else c)
         if (d2, g2) != (d, gd):
             places.append((d2, g2))
+    if sub == "commit" and wrote[0]:
+        out.append("opaque\t同じコマンドの中で commit より前にファイルを書き換える文があり、書き換え後の内容を検査できません。書き換えと commit を別のコマンドに分けて実行してください")
+        return here
     for pd, pg in places:
         if sub == "commit":
             out.append("commit\t" + pd + "\t" + (pg or "-"))
@@ -832,7 +859,7 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
   fi
   [ "$kind" = forceadd ] && continue   # commit の検査のときに使う
   if [ "$kind" = ask ]; then ASK=1; continue; fi
-  [ "$kind" = opaque ] && block "${dir}。commit / push かどうか決められないため止めました。"
+  [ "$kind" = opaque ] && block "${dir}（検査できないため、念のため止めました）。"
   if [ "$kind" = unresolved ]; then
     block "コマンド中のパス（${dir}）が変数を含んでいて、どこを commit / push するのか決められないため止めました。パスを直接書いて実行し直してください。"
   fi
@@ -865,6 +892,7 @@ if printf '%s\n' "$targets" | grep -q '^commit'; then
   printf '%s' "$input" | python3 -c 'import json,sys; sys.stdout.write((json.load(sys.stdin).get("tool_input") or {}).get("command") or "")' >"$tmp_cmd" \
     || block "コマンドを取り出せなかったため、念のため止めました。"
   # 除外設定は、commit する場所ごとのものを使う（ファイルの検査と合わせる）
+  unset GIT_DIR GIT_WORK_TREE   # 上のループで最後の対象に向けたままにしない
   printf '%s\n' "$targets" | awk -F '\t' '$1 == "commit" { print $2 }' | sort -u >"$tmp_out.dirs"
   while IFS= read -r cdir; do
     gl_cfg "$cdir"
