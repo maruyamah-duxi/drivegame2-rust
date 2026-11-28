@@ -62,13 +62,13 @@ jobs:
             # ルール集の構成が変わった・名前を間違えたときに、検査しないまま成功しないよう止める
             [ -d ".semgrep-rules-src/$d" ] || { echo "::error::ルール集に $d がありません（SEMGREP_RULES_DIRS / SEMGREP_RULES_COMMIT を確認）"; exit 1; }
             n=0
-            while read -r f; do
+            while IFS= read -r -d '' f; do   # ファイル名は NUL 区切りで受け取る
               dest="$RULES/${f#.semgrep-rules-src/}"
               mkdir -p "$(dirname "$dest")"
               cp "$f" "$dest"
               n=$((n + 1))
             done < <(find ".semgrep-rules-src/$d" -path '*/security/*' \( -name '*.yaml' -o -name '*.yml' \) \
-                          ! -name '*.test.yaml' ! -name '*.test.yml')
+                          ! -name '*.test.yaml' ! -name '*.test.yml' -print0)
             [ "$n" -gt 0 ] || { echo "::error::$d の security ルールが 0 件です"; exit 1; }
             echo "  $d: $n 件"
           done
@@ -79,19 +79,28 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          set -eu
-          args="scan --config /rules --metrics=off"
+          set -euo pipefail
+          args=(scan --config /rules --metrics=off)
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # 比較の基準は「checkout した merge commit の 1 つ目の親」＝今のベース。
             # github.event.pull_request.base.sha はベースが進んでも古いままのことがあり、そのまま使うと
             # 後からベースに入った他の PR の変更まで「この PR の差分」に数えてしまう
-            if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]; then BASE=$(git rev-parse HEAD^1); else BASE="$BASE_SHA"; fi
-            args="$args --error --baseline-commit $BASE"
+            # コンフリクトしていて merge commit が作られない PR では、ベースブランチとの分岐点を使う
+            parents=$(git rev-list --parents -n 1 HEAD) || { echo "::error::HEAD の親を取得できませんでした"; exit 1; }
+            if [ "$(echo "$parents" | wc -w)" -eq 3 ]; then
+              BASE=$(git rev-parse HEAD^1)
+            else
+              BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null) || BASE="$BASE_SHA"
+            fi
+            args+=(--error --baseline-commit "$BASE")
           fi
-          # ルールは手元にあるのでネットワークは使わない。--baseline-commit が git を操作するためソースは書き込み可で渡す
-          docker run --rm --network=none \
+          # ルールは手元にあるのでネットワークは使わない。--baseline-commit が git を操作するためソースは書き込み可で渡す。
+          # ランナーと同じユーザーで動かす（root で動かすと、使い回されるワークスペースに root 所有の
+          # ファイルが残り、以降のジョブの checkout が失敗する）
+          docker run --rm --network=none --user "$(id -u):$(id -g)" -e HOME=/tmp \
             -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/semgrep-rules:/rules:ro" -w /src \
             -e SEMGREP_SEND_METRICS=off \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
-            "$SEMGREP_IMAGE" semgrep $args
+            "$SEMGREP_IMAGE" semgrep "${args[@]}"
