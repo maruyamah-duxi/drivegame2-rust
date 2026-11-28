@@ -95,6 +95,7 @@ jobs:
           scan() {
             osv-scanner scan source -r --format json "$1" > "$2"
             local rc=$?
+            SCAN_RC=$rc
             case "$rc" in
               0|1) ;;
               128) echo '{"results":[]}' > "$2" ;;
@@ -121,6 +122,8 @@ jobs:
             BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null) || BASE="$BASE_SHA"
           fi
           scan . "$RUNNER_TEMP/osv-head.json"
+          # この PR の状態にロックファイル等が無ければ、増えた脆弱性も無いので base は取り出さない
+          if [ "$SCAN_RC" -eq 128 ]; then echo "ロックファイルが無いためスキップ"; exit 0; fi
           # 変更前（base）の状態を別ディレクトリに取り出して同じようにスキャンする。
           # ランナーは作業ディレクトリを使い回すので、前回の残り（キャンセルで後片付けが走らなかった
           # ディレクトリと登録）を掃除してから作り、終わったら（キャンセルされても）消す。

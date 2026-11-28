@@ -21,9 +21,10 @@
 # gitleaks は版を固定する。PATH にあっても版が違えば使わず、版と SHA-256 を固定した公式バイナリを
 # 取得してキャッシュする（版は .github/workflows/security.yml の GITLEAKS_VERSION と揃える。更新時は両方）。
 # 検査できない状態（取得失敗、gitleaks のエラー、コマンドを解析できないなど）では、安全側に倒してコマンドを止める。
-# フック自体がタイムアウトすると Claude Code はコマンドを通してしまうので、取得には
-# フックのタイムアウト（settings.json の 120 秒）より短い上限を付ける。
+# フック自体がタイムアウトすると Claude Code はコマンドを通してしまうので、取得と検査の全体に
+# フックのタイムアウト（settings.json の 120 秒）より短い期限（100 秒）を付け、超えたら止める。
 set -uo pipefail
+DEADLINE=$((SECONDS + 100))
 
 GITLEAKS_VERSION=8.30.1
 LEAK_EXIT=99   # gitleaks が「検出あり」で返す終了コード。これ以外の失敗はエラーとして扱う
@@ -42,9 +43,11 @@ block() { echo "secret-guard: $*" >&2; exit 2; }
 # フックが想定外に落ちると（set -u の未定義変数など）終了コード 1 になり、Claude Code は
 # コマンドを通してしまう。0（通す）と 2（止める）以外で終わったら、止める側に寄せる。
 tmp_index=""
+tmp_out=""
 on_exit() {
   local rc=$?
   [ -n "$tmp_index" ] && rm -f "$tmp_index"
+  [ -n "$tmp_out" ] && rm -f "$tmp_out"
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
     echo "secret-guard: フックが異常終了（終了コード ${rc}）したため、念のため止めました。" >&2
     exit 2
@@ -52,7 +55,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-input=$(cat)
+input=$(cat) || block "フックへの入力を読み取れなかったため、念のため止めました。"
 
 # 手早く絞る: git と commit / push の両方を含まないコマンドは対象外
 printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' || exit 0
@@ -169,23 +172,32 @@ def strip_heredocs(text):
         pending = heredoc_words(line)
     return "\n".join(out)
 
-def parse(text):
-    found = False
+found = {"commit": False, "push": False}
+seen = []   # 解析できた字句（ヒアドキュメント本文と # コメントを除いたもの）
+GITWORD = re.compile(r"\bgit\b")
+KINDS = re.compile(r"\b(commit|push)\b")
+
+def parse(text, start=None):
     # 改行は文の区切り。改行そのものも残す（# コメントは改行で終わるので、消すと後ろの行まで
     # コメント扱いになり、`# メモ` の次の行の cd / git commit を見落とす）
     lex = shlex.shlex(strip_heredocs(text).replace("\n", " ;\n"), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = list(lex)
-    here, seg = cwd, []
+    seen.extend(tokens)
+    here, seg, stack = (start or cwd), [], []
     for tok in tokens + [";"]:
         if tok and set(tok) <= set(";&|()"):
             if seg:
-                here, hit = segment(seg, here)
-                found = found or hit
+                here = segment(seg, here)
             seg = []
+            # ( … ) はサブシェル。中の cd は外に効かないので、閉じたら元の場所に戻す
+            for ch in tok:
+                if ch == "(":
+                    stack.append(here)
+                elif ch == ")" and stack:
+                    here = stack.pop()
         else:
             seg.append(tok)
-    return found
 
 def segment(seg, here):
     # export GIT_DIR=... / declare -x ... / typeset -x ... / unset GIT_DIR は以降の文に効く
@@ -194,11 +206,11 @@ def segment(seg, here):
             if ASSIGN.match(a):
                 k, v = a.split("=", 1)
                 shell_env[k] = v
-        return here, False
+        return here
     if seg[0] == "unset":
         for a in seg[1:]:
             shell_env.pop(a, None)
-        return here, False
+        return here
     env = dict(shell_env)
     # `env [-i] [-u NAME] K=V ... git ...` は env を読み飛ばす
     if seg[0] in ("env", "/usr/bin/env"):
@@ -216,61 +228,80 @@ def segment(seg, here):
     if not seg:
         # 代入だけの文（GIT_DIR=... ;）は以降の文に効く（export 済みの変数なら git にも渡る）
         shell_env.update(prefix)
-        return here, False
+        return here
     env.update(prefix)
     if seg[0] in ("cd", "pushd") and len(seg) > 1 and seg[1] != "-":
-        return resolve(here, seg[1], env), False
+        return resolve(here, seg[1], env)
+    # bash -c "…" / sh -c "…" は、中のコマンドをその場所から解析する
+    if os.path.basename(seg[0]) in ("bash", "sh", "zsh", "dash") and "-c" in seg[1:-1]:
+        parse(seg[seg.index("-c", 1) + 1], here)
+        return here
     if os.path.basename(seg[0]) != "git":
-        return here, False
-    d, i = here, 1
-    gd = resolve(here, env["GIT_DIR"], env) if "GIT_DIR" in env else ""
-    if "GIT_WORK_TREE" in env:
-        d = resolve(here, env["GIT_WORK_TREE"], env)
+        # git 以外の文の中の git commit / push（bash -c "git push"、$g push など）は、
+        # 他の文で git を解析できていても見逃さないよう、この場所での commit / push として検査する
+        text = " ".join(seg)
+        if GITWORD.search(text) or seg[0].startswith("$"):
+            for kind in dict.fromkeys(KINDS.findall(text)):
+                out.append("commit\t" + here + "\t-" if kind == "commit" else "push\t" + here + "\t-\t--branches\t-")
+                found[kind] = True
+        return here
+    # git は先に -C で移動してから、--git-dir / --work-tree と GIT_DIR / GIT_WORK_TREE の
+    # 相対パスをその場所から解釈する
+    c, i, gd_opt, wt_opt = here, 1, None, None
     while i < len(seg) and seg[i].startswith("-"):
         opt = seg[i]
         if opt in GIT_OPTS_WITH_ARG and i + 1 < len(seg):
             if opt == "-C":
-                d = resolve(d, seg[i + 1], env)
+                c = resolve(c, seg[i + 1], env)
             elif opt == "--work-tree":
-                d = resolve(d, seg[i + 1], env)
+                wt_opt = seg[i + 1]
             elif opt == "--git-dir":
-                gd = resolve(d, seg[i + 1], env)
+                gd_opt = seg[i + 1]
             i += 2
         else:
             if opt.startswith("--work-tree="):
-                d = resolve(d, opt.split("=", 1)[1], env)
+                wt_opt = opt.split("=", 1)[1]
             elif opt.startswith("--git-dir="):
-                gd = resolve(d, opt.split("=", 1)[1], env)
+                gd_opt = opt.split("=", 1)[1]
             i += 1
+    if gd_opt is None:
+        gd_opt = env.get("GIT_DIR")
+    if wt_opt is None:
+        wt_opt = env.get("GIT_WORK_TREE")
+    gd = resolve(c, gd_opt, env) if gd_opt else ""
+    d = resolve(c, wt_opt, env) if wt_opt else c
     if i >= len(seg):
-        return here, False
+        return here
     sub = seg[i]
     if sub == "commit":
         out.append("commit\t" + d + "\t" + (gd or "-"))
-        return here, True
-    if sub == "push":
+        found["commit"] = True
+    elif sub == "push":
         refs, remote = push_sources(seg[i + 1:])
         out.append("push\t" + d + "\t" + (gd or "-") + "\t" + (" ".join(refs) or "-") + "\t" + (remote or "-"))
-        return here, True
-    return here, False
+        found["push"] = True
+    return here
 
 try:
-    found = parse(cmd)
+    parse(cmd)
+    rest = " ".join(seen)
 except ValueError:
-    found = False
+    rest = cmd   # 字句に分けられない: 生のコマンド全体で判断する
 # コマンド置換（$( … ) / `…`）の中の git commit / push は、どこで何を対象に実行されるかを
 # 決められない（無引用のヒアドキュメント本文の中の置換も、実際に実行される）ので止める
 SUBST = re.compile(r"\$\([^()]*\bgit\b[^()]*\b(?:commit|push)\b[^()]*\)|`[^`]*\bgit\b[^`]*\b(?:commit|push)\b[^`]*`")
 if SUBST.search(cmd):
     out.append("subst\t-")
-# 解析で拾えなかったが commit / push らしき記述はある（bash -c "..." の中など）:
-# 安全側に倒して、作業ディレクトリでの commit / push として検査する
-# （`g=git; $g commit` のように git を変数経由で呼ぶ書き方も、文字が両方あればここで拾う）
-if not found and re.search(r"\bgit\b", cmd):
-    if re.search(r"\bcommit\b", cmd):
+# 解析で拾えなかったが commit / push らしき記述はある（解析の失敗、変数経由の git など）:
+# 安全側に倒して、拾えなかった種類ごとに作業ディレクトリでの commit / push として検査する
+# （どのブランチを push するか分からないので、push はまだ送っていない全ブランチのコミットを見る）
+# （commit を解析できていても、push を拾えていなければ push も検査する）
+# ヒアドキュメント本文と # コメントの中の文字は見ない（コミットメッセージ中の「git push」で誤って止めない）
+if GITWORD.search(rest):
+    if not found["commit"] and re.search(r"\bcommit\b", rest):
         out.append("commit\t" + cwd + "\t-")
-    if re.search(r"\bpush\b", cmd):
-        out.append("push\t" + cwd + "\t-\tHEAD\t-")
+    if not found["push"] and re.search(r"\bpush\b", rest):
+        out.append("push\t" + cwd + "\t-\t--branches\t-")
 print("\n".join(dict.fromkeys(out)))
 ') || block "コマンドを解析できなかったため、念のため止めました。"
 [ -z "$targets" ] && exit 0
@@ -289,7 +320,10 @@ find_gitleaks() {
   if [ ! -x "$bin" ]; then
     mkdir -p "$cache" || return 1
     tgz="$cache/gitleaks.tar.gz"
-    curl -fsSL --connect-timeout 15 --max-time 60 -o "$tgz" \
+    local left=$((DEADLINE - SECONDS - 10))
+    [ "$left" -gt 60 ] && left=60
+    [ "$left" -gt 0 ] || return 1
+    curl -fsSL --connect-timeout 15 --max-time "$left" -o "$tgz" \
       "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${key}.tar.gz" || { rm -f "$tgz"; return 1; }
     if command -v sha256sum >/dev/null 2>&1; then
       echo "$(gitleaks_sha256 "$key")  $tgz" | sha256sum -c - >/dev/null || { rm -f "$tgz"; return 1; }
@@ -302,13 +336,38 @@ find_gitleaks() {
 }
 
 GL=""
+tmp_out=$(mktemp "${TMPDIR:-/tmp}/secret-guard-out.XXXXXX") || block "一時ファイルを作れませんでした。"
+
+# 期限までの残り秒数で "$@" を実行する（macOS には timeout コマンドが無いので自前で見張る）。
+# 期限を過ぎて打ち切ったら 124 を返す
+deadline_run() {
+  local left=$((DEADLINE - SECONDS)) pid w rc
+  [ "$left" -gt 0 ] || return 124
+  "$@" &
+  pid=$!
+  # 見張りの出力は捨てる（$( … ) の中で呼ぶので、開いたままだと sleep の終わりまで待たされる）
+  ( sleep "$left"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$pid"; rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  [ "$((DEADLINE - SECONDS))" -le 0 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne "$LEAK_EXIT" ] && return 124
+  return "$rc"
+}
+
+too_slow() {
+  block "シークレット検査がフックの制限時間内に終わらなかったため、念のため止めました（${1}）。push するコミットを分ける、または手元で gitleaks を実行して確認してください。"
+}
 
 # gitleaks を $dir で実行する。検出ありなら理由付きで止め、gitleaks 自体の失敗も止める（別の文言で）
 run() {
   local dir=$1; shift
   local out rc
-  out=$(cd "$dir" && "$GL" git --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$@" . 2>&1)
+  # 出力は $( … ) ではなくファイルで受ける（打ち切った gitleaks の子プロセスが出力を開いたままだと、
+  # $( … ) はそれが終わるまで戻らず、期限が効かなくなる）
+  (cd "$dir" && deadline_run "$GL" git --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$@" .) >"$tmp_out" 2>&1
   rc=$?
+  out=$(cat "$tmp_out")
+  [ "$rc" -eq 124 ] && too_slow "$dir"
   case "$rc" in
     0) ;;
     "$LEAK_EXIT")
@@ -322,8 +381,10 @@ $(printf '%s\n' "$out" | tail -20)" ;;
 
 scan_dir() {
   local dir=$1 out rc
-  out=$("$GL" dir --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$dir" 2>&1)
+  deadline_run "$GL" dir --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$dir" >"$tmp_out" 2>&1
   rc=$?
+  out=$(cat "$tmp_out")
+  [ "$rc" -eq 124 ] && too_slow "$dir"
   case "$rc" in
     0) ;;
     "$LEAK_EXIT")
@@ -401,7 +462,9 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
   # まだ git リポジトリでない場所（同じコマンドの中で git init する場合など）は、push するものは無いが、
   # commit なら最初のコミットに入るファイルを、ディレクトリごと検査する
   if ! (cd "$dir" 2>/dev/null && git rev-parse --git-dir) >/dev/null 2>&1; then
-    [ "$kind" = commit ] || continue
+    # push するのにリポジトリでない（存在しない場所への cd など）: 実際の bash では cd が失敗して
+    # 別の場所で push されうるので、検査を飛ばさず止める
+    [ "$kind" = commit ] || block "push する場所（${dir}）が git リポジトリと確認できないため止めました。リポジトリのディレクトリで実行し直してください。"
     [ -d "$dir" ] || block "commit する場所（${dir}）がまだ無く、検査できないため止めました。ディレクトリを作るコマンドと commit するコマンドを分けて実行してください。"
     scan_dir "$dir"
     continue
