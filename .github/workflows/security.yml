@@ -109,12 +109,16 @@ jobs:
           fi
 
           command -v python3 >/dev/null || { echo "::error::ランナーに python3 がありません"; exit 1; }
+          # 比較の基準は「checkout した merge commit の 1 つ目の親」＝今のベース。
+          # github.event.pull_request.base.sha はベースが進んでも古いままのことがあり、そのまま使うと
+          # 後からベースに入った他の PR の変更まで「この PR の差分」に数えてしまう
+          if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]; then BASE=$(git rev-parse HEAD^1); else BASE="$BASE_SHA"; fi
           scan . "$RUNNER_TEMP/osv-head.json"
           # 変更前（base）の状態を別ディレクトリに取り出して同じようにスキャンする。
           # ランナーは作業ディレクトリを使い回すので、前回の登録を掃除してから作り、終わったら消す。
           BASE_DIR="$RUNNER_TEMP/osv-base-$GITHUB_RUN_ID"
           git worktree prune
-          git worktree add --force --detach "$BASE_DIR" "$BASE_SHA" >/dev/null || { echo "::error::base（$BASE_SHA）を取り出せませんでした"; exit 1; }
+          git worktree add --force --detach "$BASE_DIR" "$BASE" >/dev/null || { echo "::error::base（$BASE）を取り出せませんでした"; exit 1; }
           trap 'git worktree remove --force "$BASE_DIR" >/dev/null 2>&1; git worktree prune' EXIT
           scan "$BASE_DIR" "$RUNNER_TEMP/osv-base.json"
 
