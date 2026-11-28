@@ -116,7 +116,26 @@ GIT_ENV_KEYS = ("GIT_DIR", "GIT_WORK_TREE")
 shell_env = {k: os.environ[k] for k in GIT_ENV_KEYS if os.environ.get(k)}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
-HEREDOC = re.compile(r"<<(-?)\s*[\x27\x22]?([A-Za-z_][A-Za-z0-9_]*)[\x27\x22]?")   # \x27 = 引用符（bash の \x27…\x27 の中なので直接書かない）
+def heredoc_words(line):
+    """行の中で本当に始まっているヒアドキュメントの終端語を返す。
+    shlex で字句に分けるので、引用符の中や # コメントの `<<WORD` はヒアドキュメント扱いしない。
+    行だけでは字句に分けられない（引用符が次の行へ続くなど）ときは、ヒアドキュメント無しとみなす
+    （本文を除かないだけなので、検査が漏れる側には倒れない）"""
+    lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        toks = list(lex)
+    except ValueError:
+        return []
+    words = []
+    for k, t in enumerate(toks):
+        if t == "<<" and k + 1 < len(toks):          # <<< はヒアストリングで別の字句になる
+            w = toks[k + 1]
+            dash = w.startswith("-")
+            w = w[1:] if dash else w
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", w or ""):
+                words.append((dash, w))
+    return words
 
 def strip_heredocs(text):
     """ヒアドキュメント（<<EOF … EOF）の本文を除く。本文はコマンドではないので、
@@ -129,12 +148,14 @@ def strip_heredocs(text):
                 pending.pop(0)
             continue
         out.append(line)
-        pending = [(m.group(1) == "-", m.group(2)) for m in HEREDOC.finditer(line)]
+        pending = heredoc_words(line)
     return "\n".join(out)
 
 def parse(text):
     found = False
-    lex = shlex.shlex(strip_heredocs(text).replace("\n", " ; "), posix=True, punctuation_chars=True)
+    # 改行は文の区切り。改行そのものも残す（# コメントは改行で終わるので、消すと後ろの行まで
+    # コメント扱いになり、`# メモ` の次の行の cd / git commit を見落とす）
+    lex = shlex.shlex(strip_heredocs(text).replace("\n", " ;\n"), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = list(lex)
     here, seg = cwd, []
