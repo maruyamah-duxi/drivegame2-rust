@@ -69,7 +69,7 @@ input=$(cat) || block "フックへの入力を読み取れなかったため、
 ASK=""
 allow() {
   if [ -n "$ASK" ]; then
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"secret-guard: フックまたはシークレット検査の設定（.claude/settings.json、.claude/hooks/、.gitleaks.toml、.gitleaksignore）を書き換える・消す可能性があるコマンドです。内容を確認してから許可してください。"}}'
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"secret-guard: フックまたはシークレット検査の設定（.claude ディレクトリ、.gitleaks.toml、.gitleaksignore）を書き換える・消す可能性がある操作です。内容を確認してから許可してください。"}}'
   fi
   exit 0
 }
@@ -105,7 +105,8 @@ fi
 #   push<TAB><work tree><TAB><git dir><TAB><push する元の ref（空白区切り）><TAB><push 先（リモート名 / URL / 指定なしは -）>
 #   unresolved<TAB><解決できなかったパス>
 #   ask<TAB>-（フックや検査設定を書き換えうるので、確認を求める）
-targets=$(printf '%s' "$input" | python3 -c '
+# エイリアスの確認（git config の呼び出し）に使ってよい秒数。検査のための時間を残す
+targets=$(printf '%s' "$input" | SG_BUDGET=$((DEADLINE - SECONDS - 60)) python3 -c '
 import json, os, re, shlex, sys
 
 data = json.load(sys.stdin)
@@ -178,7 +179,12 @@ GIT_ENV_KEYS = ("GIT_DIR", "GIT_WORK_TREE")
 shell_env = {k: os.environ[k] for k in GIT_ENV_KEYS if os.environ.get(k)}
 shell_vars, maybe_env = {}, {}
 
+def expand(v):
+    """分かっている変数（コマンド中で代入したもの）を展開する。分からないものは $ のまま残す"""
+    return VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2)) or m.group(0), v)
+
 def assign(k, v, exported):
+    v = expand(v)
     shell_vars[k] = v
     if k not in GIT_ENV_KEYS:
         return
@@ -201,6 +207,33 @@ SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 readonly_ok = [True]
 touches = [False]
+
+PROTECTED_NAMES = (".claude", ".gitleaks.toml", ".gitleaksignore")
+
+def may_name_protected(tok):
+    """ブレース展開（.claud{e,}）やグロブ（.cl?ude）で、保護対象の名前になりうるか"""
+    import fnmatch
+    cands = [tok]
+    for _ in range(8):                       # 単純な {a,b} を展開する（入れ子は外側から）
+        nxt = []
+        for c in cands:
+            m = re.search(r"\{([^{}]*,[^{}]*)\}", c)
+            if m:
+                nxt += [c[:m.start()] + part + c[m.end():] for part in m.group(1).split(",")]
+            else:
+                nxt.append(c)
+        if nxt == cands:
+            break
+        cands = nxt[:64]
+    for c in cands:
+        if PROTECTED.search(c):
+            return True
+        for comp in c.split("/"):
+            # 既定ではグロブはドットで始まる名前に一致しないので、パターンもドットで始まるものだけ見る
+            if comp.startswith(".") and any(ch in comp for ch in "*?["):
+                if any(fnmatch.fnmatchcase(n, comp) for n in PROTECTED_NAMES):
+                    return True
+    return False
 
 def check_readonly(seg):
     """この文が、作業ツリーのファイルを書き換えない（読むだけ）と分かるか"""
@@ -248,13 +281,23 @@ KNOWN_SUBS = {"commit", "push", "add", "status", "diff", "log", "show", "fetch",
               "config", "init", "clone", "worktree", "cherry-pick", "revert", "rm", "mv", "ls-files", "grep",
               "blame", "describe", "submodule", "apply", "am", "clean", "notes", "bisect", "reflog", "gc", "fsck"}
 
+import time
+ALIAS_DEADLINE = time.monotonic() + max(0, int(os.environ.get("SG_BUDGET") or "20"))
+
 def git_alias(where, gitdir, name):
-    """設定済みの git エイリアスの中身。無ければ None"""
+    """設定済みの git エイリアスの中身。無ければ None。
+    フック全体の期限に収まるよう、使ってよい時間（SG_BUDGET）を超えたら確認できないとして止める"""
     import subprocess
+    left = ALIAS_DEADLINE - time.monotonic()
+    if left <= 0:
+        out.append("opaque\tgit のエイリアスを確認する時間が足りません")
+        return None
     cmd = ["git"] + (["--git-dir", gitdir] if gitdir else []) + ["config", "--get", "alias." + name]
     try:
-        r = subprocess.run(cmd, cwd=where if os.path.isdir(where) else None, capture_output=True, text=True, timeout=5)
+        r = subprocess.run(cmd, cwd=where if os.path.isdir(where) else None, capture_output=True, text=True,
+                           timeout=min(5, left))
     except Exception:
+        out.append("opaque\tgit のエイリアス（" + name + "）を確認できませんでした")
         return None
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
@@ -366,7 +409,8 @@ def segment(seg, here):
     # 変数（f=.claude; rm -rf $f）は展開してから、今いる場所（cd .claude; rm …）も見る
     joined = " ".join(seg)
     expanded = VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2)) or m.group(0), joined)
-    if PROTECTED.search(joined) or PROTECTED.search(expanded) or PROTECTED.search(here + "/"):
+    if PROTECTED.search(joined) or PROTECTED.search(expanded) or PROTECTED.search(here + "/") \
+            or any(may_name_protected(t) for t in seg):
         touches[0] = True
     if seg[0] in ("export", "declare", "typeset", "readonly", "local"):
         exported = seg[0] == "export" or any(a.startswith("-") and "x" in a for a in seg[1:])
@@ -479,6 +523,12 @@ def segment(seg, here):
         return here
     sub = seg[i]
     rest_args = seg[i + 1:]
+    # サブコマンドを変数で渡している（git "$S"）: 分かる値なら展開し、分からなければ止める
+    if "$" in sub or "`" in sub:
+        sub = expand(sub)
+        if "$" in sub or "`" in sub:
+            out.append("opaque\tgit のサブコマンド（" + seg[i] + "）が変数で、中身を決められません")
+            return here
     # エイリアス（git -c alias.ci=commit ci、git config alias.ci commit で登録したもの）を展開する。
     # ! で始まるシェルのエイリアスは中身を追えないので止める
     for _ in range(5):
@@ -550,6 +600,7 @@ try:
     rest = " ".join(seen + unterminated)
 except ValueError:
     rest = cmd   # 字句に分けられない: 生のコマンド全体で判断する
+    readonly_ok[0] = False   # 読むだけとも分からない
 # コマンド置換（$( … ) / `…`）の中の git commit / push は、どこで何を対象に実行されるかを
 # 決められない（無引用のヒアドキュメント本文の中の置換も、実際に実行される）ので止める
 SUBST = re.compile(r"\$\([^()]*\bgit\b[^()]*\b(?:commit|push)\b[^()]*\)|`[^`]*\bgit\b[^`]*\b(?:commit|push)\b[^`]*`")
