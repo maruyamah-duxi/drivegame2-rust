@@ -119,7 +119,7 @@ jobs:
           if [ "$(echo "$parents" | wc -w)" -eq 3 ]; then
             BASE=$(git rev-parse HEAD^1)
           else
-            BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null) || BASE="$BASE_SHA"
+            BASE=$(git merge-base HEAD "origin/$BASE_REF") || { echo "::error::ベースブランチ（origin/$BASE_REF）との分岐点を取得できませんでした"; exit 1; }
           fi
           # 前回の残り（キャンセルで後片付けが走らなかった base のディレクトリと worktree の登録）は、
           # 下でスキップして終わる場合も含めて、最初に消す

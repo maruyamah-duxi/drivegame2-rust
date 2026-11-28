@@ -18,8 +18,10 @@
 #       別名でコピーした git の実行ファイル（cp /usr/bin/git /tmp/vcs など）も追えない
 #       （最後の砦は CI の security.yml）。git のエイリアスは展開して追い、! で始まるシェルの
 #       エイリアスは中身を追えないので止める。
-# また、フックと検査設定（.claude/settings.json、.claude/hooks/、.gitleaks.toml、.gitleaksignore）を
-# Bash で書き換える・消すコマンドは、確認を求める（settings.json の ask は Edit ツールにしか効かないため）。
+# また、フックと検査設定（.claude ディレクトリ全体、.gitleaks.toml、.gitleaksignore）に触れるコマンドは、
+# 読むだけと分かるもの以外は確認を求める（settings.json の ask は Edit ツールにしか効かないため）。
+# 限界: eval や printf %b など、実行時に名前を組み立てる書き方は追えない（$'…' の ANSI-C 引用と
+#       コマンド置換を含むコマンドは、読むだけと扱わず念のため確認を求める）。
 # 除外は .gitleaks.toml / .gitleaksignore（security.yml と共通）。
 #
 # gitleaks は版を固定する。PATH にあっても使わず、版と SHA-256 を固定した公式バイナリを
@@ -76,7 +78,8 @@ allow() {
 # すり抜けるため）。すべてのコマンドを shlex で字句に分けてから判断する。
 # python3 が無い環境だけは、git と commit / push の文字があれば止め、無ければ通す
 if ! command -v python3 >/dev/null 2>&1; then
-  printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' \
+  # 解析できないので、commit / push の語があれば（git の語が無くても。エイリアスや別名の git かもしれない）止める
+  printf '%s' "$input" | grep -Eqi 'commit|push' \
     && block "python3 が無いため、コマンドを解析できず念のため止めました。"
   # フックと検査設定（.claude ディレクトリ、.gitleaks.toml、.gitleaksignore）に触れるコマンドは確認を求める
   printf '%s' "$input" | grep -Eq '\.claude([^A-Za-z0-9_-]|$)|\.gitleaks(\.toml|ignore)' && ASK=1
@@ -148,8 +151,8 @@ def push_sources(args):
             refs.append(src)
     # 位置引数がある場合は、--repo より位置引数の先頭が push 先になる（git の仕様。--repo=x main は main が宛先）
     remote = positional[0] if positional else repo
-    if delete:
-        return [], remote                  # 検査するものが無い
+    if delete or (positional[1:] and not refs):
+        return [], remote                  # 削除だけ（--delete や :branch）。検査するものが無い
     return (refs or ["HEAD"]), remote
 
 # git の向き先を変える環境変数。コマンドの前の文で export されたものは、後の git に効くので追う。
@@ -186,6 +189,9 @@ touches = [False]
 
 def check_readonly(seg):
     """この文が、作業ツリーのファイルを書き換えない（読むだけ）と分かるか"""
+    # コマンド置換（`…` / 引用符の中の $( … )）は中で何でも実行できる
+    if any("`" in t or "$(" in t for t in seg):
+        return False
     for k, t in enumerate(seg):
         if t in REDIRECTS:
             nxt = seg[k + 1] if k + 1 < len(seg) else ""
@@ -532,7 +538,8 @@ if GITWORD.search(rest):
         out.append("commit\t" + cwd + "\t-")
     if not found["push"] and re.search(r"\bpush\b", rest):
         out.append("push\t" + cwd + "\t-\t--branches\t-")
-if (touches[0] or PROTECTED.search(cmd)) and not readonly_ok[0]:
+# $\x27\\x2e…\x27（ANSI-C 引用）は shlex では名前を復元できないので、触れているものとして扱う
+if (touches[0] or PROTECTED.search(cmd) or "$\x27" in cmd) and not readonly_ok[0]:
     out.append("ask\t-")
 # 決められないパスは、commit / push があるときだけ問題にする（git status などは止めない）
 if not any(o.split("\t", 1)[0] in ("commit", "push", "subst", "opaque") for o in out):
