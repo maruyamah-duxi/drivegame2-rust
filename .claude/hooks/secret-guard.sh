@@ -179,9 +179,17 @@ GIT_ENV_KEYS = ("GIT_DIR", "GIT_WORK_TREE")
 shell_env = {k: os.environ[k] for k in GIT_ENV_KEYS if os.environ.get(k)}
 shell_vars, maybe_env = {}, {}
 
+def var_value(m):
+    """$VAR の値。コマンド中で代入した値（空文字列も含む）があればそれ、unset 済みなら空、知らなければ $VAR のまま"""
+    name = m.group(1) or m.group(2)
+    if name not in shell_vars:
+        return m.group(0)
+    v = shell_vars[name]
+    return "" if v is None else v
+
 def expand(v):
     """分かっている変数（コマンド中で代入したもの）を展開する。分からないものは $ のまま残す"""
-    return VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2)) or m.group(0), v)
+    return VAR.sub(lambda m: var_value(m), v)
 
 def assign(k, v, exported):
     v = expand(v)
@@ -408,7 +416,7 @@ def segment(seg, here):
     # フックや検査設定に触れるか。引用符で分けた名前（.cla""ude）も字句に分けた後なら見える。
     # 変数（f=.claude; rm -rf $f）は展開してから、今いる場所（cd .claude; rm …）も見る
     joined = " ".join(seg)
-    expanded = VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2)) or m.group(0), joined)
+    expanded = VAR.sub(lambda m: var_value(m), joined)
     if PROTECTED.search(joined) or PROTECTED.search(expanded) or PROTECTED.search(here + "/") \
             or any(may_name_protected(t) for t in seg):
         touches[0] = True
