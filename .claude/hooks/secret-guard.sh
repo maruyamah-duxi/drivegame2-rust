@@ -15,7 +15,10 @@
 # 変数で組み立てたパスなど解決できない場所は、検査できないので止める。
 # 限界: eval や別スクリプトの中で実行される git は追えない（git と commit / push の文字が
 #       コマンド中にあれば、作業ディレクトリでの commit / push として検査はする）。
-#       git のエイリアス（git config alias.ci commit で `git ci` など）も追えない。
+#       git のエイリアス（git config alias.ci commit で `git ci` など）や、別名でコピーした git の
+#       実行ファイル（cp /usr/bin/git /tmp/vcs など）も追えない（最後の砦は CI の security.yml）。
+# また、フックと検査設定（.claude/settings.json、.claude/hooks/、.gitleaks.toml、.gitleaksignore）を
+# Bash で書き換える・消すコマンドは、確認を求める（settings.json の ask は Edit ツールにしか効かないため）。
 # 除外は .gitleaks.toml / .gitleaksignore（security.yml と共通）。
 #
 # gitleaks は版を固定する。PATH にあっても版が違えば使わず、版と SHA-256 を固定した公式バイナリを
@@ -59,8 +62,25 @@ trap on_exit EXIT
 
 input=$(cat) || block "フックへの入力を読み取れなかったため、念のため止めました。"
 
+# 通す。フックや検査設定を書き換えうるコマンドなら、通す代わりに確認を求める（検査で止める場合は block が優先）
+ASK=""
+allow() {
+  if [ -n "$ASK" ]; then
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"secret-guard: フックまたはシークレット検査の設定（.claude/settings.json、.claude/hooks/、.gitleaks.toml、.gitleaksignore）を書き換える・消す可能性があるコマンドです。内容を確認してから許可してください。"}}'
+  fi
+  exit 0
+}
+if printf '%s' "$input" | grep -Eq '\.claude/(settings(\.local)?\.json|hooks)|\.gitleaks(\.toml|ignore)'; then
+  # 読むだけのコマンド（cat / grep / git diff など）は確認しない。書き込み・削除・実行系の語や、
+  # /dev/null と 2>&1 以外のリダイレクトがあれば確認を求める
+  w=$(printf '%s' "$input" | sed -E 's/[0-9]*>[[:space:]]*\/dev\/null//g; s/[0-9]*>&[0-9]//g')
+  if printf '%s' "$w" | grep -Eq '>|(^|[^A-Za-z0-9_.-])(rm|mv|cp|tee|truncate|ln|chmod|chown|install|dd|unlink|rsync|python3?|perl|ruby|node|sh|bash|zsh|ed|ex|vi|vim|nano)([^A-Za-z0-9_.-]|$)|sed[^|;&]*[[:space:]](-[A-Za-z]*i|--in-place)|git[^|;&]*[[:space:]](rm|mv|checkout|restore|reset|apply|stash|clean|switch)([^A-Za-z0-9_.-]|$)'; then
+    ASK=1
+  fi
+fi
+
 # 手早く絞る: git と commit / push の両方を含まないコマンドは対象外
-printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' || exit 0
+printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' || allow
 
 command -v python3 >/dev/null 2>&1 || block "python3 が無いため、コマンドを解析できず念のため止めました。"
 
@@ -152,7 +172,7 @@ def assign(k, v, exported):
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 def heredoc_words(line, arith=0):
-    """行の中で本当に始まっているヒアドキュメントの終端語を返す。
+    """行の中で本当に始まっているヒアドキュメントの終端語を返す（正規表現では判定しない）。
     shlex で字句に分けるので、引用符の中や # コメントの `<<WORD` はヒアドキュメント扱いしない。
     行だけでは字句に分けられない（引用符が次の行へ続くなど）ときは、ヒアドキュメント無しとみなす
     （本文を除かないだけなので、検査が漏れる側には倒れない）"""
@@ -390,7 +410,7 @@ if GITWORD.search(rest):
         out.append("push\t" + cwd + "\t-\t--branches\t-")
 print("\n".join(dict.fromkeys(out)))
 ') || block "コマンドを解析できなかったため、念のため止めました。"
-[ -z "$targets" ] && exit 0
+[ -z "$targets" ] && allow
 
 find_gitleaks() {
   if command -v gitleaks >/dev/null 2>&1 \
@@ -405,23 +425,38 @@ find_gitleaks() {
   bin="$cache/gitleaks"
   if [ ! -x "$bin" ]; then
     mkdir -p "$cache" || return 1
-    tgz="$cache/gitleaks.tar.gz"
+    # 同時に複数のフックが取得しても壊れないよう、プロセスごとの一時ディレクトリに取得・展開してから置き換える
+    local dl
+    dl=$(mktemp -d "$cache/dl.XXXXXX") || return 1
+    tgz="$dl/gitleaks.tar.gz"
     local left=$((DEADLINE - SECONDS - 10))
     [ "$left" -gt 60 ] && left=60
     [ "$left" -gt 0 ] || return 1
     curl -fsSL --connect-timeout 15 --max-time "$left" -o "$tgz" \
-      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${key}.tar.gz" || { rm -f "$tgz"; return 1; }
+      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${key}.tar.gz" || { rm -rf "$dl"; return 1; }
     if command -v sha256sum >/dev/null 2>&1; then
-      echo "$(gitleaks_sha256 "$key")  $tgz" | sha256sum -c - >/dev/null || { rm -f "$tgz"; return 1; }
+      echo "$(gitleaks_sha256 "$key")  $tgz" | sha256sum -c - >/dev/null || { rm -rf "$dl"; return 1; }
     else
-      echo "$(gitleaks_sha256 "$key")  $tgz" | shasum -a 256 -c - >/dev/null || { rm -f "$tgz"; return 1; }
+      echo "$(gitleaks_sha256 "$key")  $tgz" | shasum -a 256 -c - >/dev/null || { rm -rf "$dl"; return 1; }
     fi
-    tar -xzf "$tgz" -C "$cache" gitleaks && rm -f "$tgz" || return 1
+    tar -xzf "$tgz" -C "$dl" gitleaks && mv -f "$dl/gitleaks" "$bin" || { rm -rf "$dl"; return 1; }
+    rm -rf "$dl"
   fi
   echo "$bin"
 }
 
 GL=""
+# 除外設定（.gitleaks.toml / .gitleaksignore）は、検査する場所のリポジトリのルートから読む
+# （gitleaks は検査対象のディレクトリしか探さないので、サブディレクトリで commit すると読まれない）
+gl_cfg() {
+  GLCFG=()
+  local root
+  root=$(cd "$1" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || root=$1
+  [ -n "$root" ] || root=$1
+  [ -f "$root/.gitleaks.toml" ] && GLCFG+=(--config "$root/.gitleaks.toml")
+  [ -f "$root/.gitleaksignore" ] && GLCFG+=(--gitleaks-ignore-path "$root/.gitleaksignore")
+  return 0
+}
 tmp_out=$(mktemp "${TMPDIR:-/tmp}/secret-guard-out.XXXXXX") || block "一時ファイルを作れませんでした。"
 
 # 期限までの残り秒数で "$@" を実行する（macOS には timeout コマンドが無いので自前で見張る）。
@@ -455,7 +490,8 @@ run() {
   local out rc
   # 出力は $( … ) ではなくファイルで受ける（打ち切った gitleaks の子プロセスが出力を開いたままだと、
   # $( … ) はそれが終わるまで戻らず、期限が効かなくなる）
-  (cd "$dir" && deadline_run "$GL" git --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$@" .) >"$tmp_out" 2>&1
+  gl_cfg "$dir"
+  (cd "$dir" && deadline_run "$GL" git "${GLCFG[@]+"${GLCFG[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$@" .) >"$tmp_out" 2>&1
   rc=$?
   out=$(cat "$tmp_out")
   [ "$rc" -eq 124 ] && too_slow "$dir"
@@ -472,7 +508,8 @@ $(printf '%s\n' "$out" | tail -20)" ;;
 
 scan_dir() {
   local dir=$1 out rc
-  deadline_run "$GL" dir --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$dir" >"$tmp_out" 2>&1
+  gl_cfg "$dir"
+  deadline_run "$GL" dir "${GLCFG[@]+"${GLCFG[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$dir" >"$tmp_out" 2>&1
   rc=$?
   out=$(cat "$tmp_out")
   [ "$rc" -eq 124 ] && too_slow "$dir"
@@ -589,9 +626,8 @@ if printf '%s\n' "$targets" | grep -q '^commit'; then
   tmp_cmd=$(mktemp "${TMPDIR:-/tmp}/secret-guard-cmd.XXXXXX") || block "一時ファイルを作れませんでした。"
   printf '%s' "$input" | python3 -c 'import json,sys; sys.stdout.write((json.load(sys.stdin).get("tool_input") or {}).get("command") or "")' >"$tmp_cmd" \
     || block "コマンドを取り出せなかったため、念のため止めました。"
-  cfg=()
-  [ -f "${CLAUDE_PROJECT_DIR:-.}/.gitleaks.toml" ] && cfg=(--config "${CLAUDE_PROJECT_DIR:-.}/.gitleaks.toml")
-  DR_IN="$tmp_cmd" deadline_run "$GL" stdin "${cfg[@]+"${cfg[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" >"$tmp_out" 2>&1
+  gl_cfg "${CLAUDE_PROJECT_DIR:-$PWD}"
+  DR_IN="$tmp_cmd" deadline_run "$GL" stdin "${GLCFG[@]+"${GLCFG[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" >"$tmp_out" 2>&1
   rc=$?
   [ "$rc" -eq 124 ] && too_slow "コマンドの文字列"
   case "$rc" in
@@ -604,4 +640,4 @@ $(grep -E '^(RuleID|Line|Finding):|leaks found' "$tmp_out" | head -20)" ;;
 $(tail -20 "$tmp_out")" ;;
   esac
 fi
-exit 0
+allow
