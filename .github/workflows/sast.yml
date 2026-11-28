@@ -92,7 +92,7 @@ jobs:
             if [ "$(echo "$parents" | wc -w)" -eq 3 ]; then
               BASE=$(git rev-parse HEAD^1) || { echo "::error::merge commit の親を取得できませんでした"; exit 1; }
             else
-              BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null) || BASE="$BASE_SHA"
+              BASE=$(git merge-base HEAD "origin/$BASE_REF") || { echo "::error::ベースブランチ（origin/$BASE_REF）との分岐点を取得できませんでした"; exit 1; }
             fi
             args+=(--error --baseline-commit "$BASE")
           fi
@@ -103,6 +103,5 @@ jobs:
           docker run --rm --network=none --user "$(id -u):$(id -g)" \
             -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config \
             -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/semgrep-rules:/rules:ro" -w /src \
-            \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
             "$SEMGREP_IMAGE" semgrep "${args[@]}"
