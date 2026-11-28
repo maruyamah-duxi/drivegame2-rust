@@ -21,7 +21,7 @@
 # Bash で書き換える・消すコマンドは、確認を求める（settings.json の ask は Edit ツールにしか効かないため）。
 # 除外は .gitleaks.toml / .gitleaksignore（security.yml と共通）。
 #
-# gitleaks は版を固定する。PATH にあっても版が違えば使わず、版と SHA-256 を固定した公式バイナリを
+# gitleaks は版を固定する。PATH にあっても使わず、版と SHA-256 を固定した公式バイナリを
 # 取得してキャッシュする（版は .github/workflows/security.yml の GITLEAKS_VERSION と揃える。更新時は両方）。
 # 検査できない状態（取得失敗、gitleaks のエラー、コマンドを解析できないなど）では、安全側に倒してコマンドを止める。
 # フック自体がタイムアウトすると Claude Code はコマンドを通してしまうので、取得と検査の全体に
@@ -70,14 +70,6 @@ allow() {
   fi
   exit 0
 }
-if printf '%s' "$input" | grep -Eq '\.claude/(settings(\.local)?\.json|hooks)|\.gitleaks(\.toml|ignore)'; then
-  # 読むだけのコマンド（cat / grep / git diff など）は確認しない。書き込み・削除・実行系の語や、
-  # /dev/null と 2>&1 以外のリダイレクトがあれば確認を求める
-  w=$(printf '%s' "$input" | sed -E 's/[0-9]*>[[:space:]]*\/dev\/null//g; s/[0-9]*>&[0-9]//g')
-  if printf '%s' "$w" | grep -Eq '>|(^|[^A-Za-z0-9_.-])(rm|mv|cp|tee|truncate|ln|chmod|chown|install|dd|unlink|rsync|python3?|perl|ruby|node|sh|bash|zsh|ed|ex|vi|vim|nano)([^A-Za-z0-9_.-]|$)|sed[^|;&]*[[:space:]](-[A-Za-z]*i|--in-place)|git[^|;&]*[[:space:]](rm|mv|checkout|restore|reset|apply|stash|clean|switch)([^A-Za-z0-9_.-]|$)'; then
-    ASK=1
-  fi
-fi
 
 # 文字列での絞り込みはしない（git co""mmit や g\it のように引用符・バックスラッシュで語を分けると
 # すり抜けるため）。すべてのコマンドを shlex で字句に分けてから判断する。
@@ -85,6 +77,8 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
   printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' \
     && block "python3 が無いため、コマンドを解析できず念のため止めました。"
+  # フックと検査設定（.claude ディレクトリ、.gitleaks.toml、.gitleaksignore）に触れるコマンドは確認を求める
+  printf '%s' "$input" | grep -Eq '\.claude([^A-Za-z0-9_-]|$)|\.gitleaks(\.toml|ignore)' && ASK=1
   allow
 fi
 
@@ -92,6 +86,7 @@ fi
 #   commit<TAB><work tree><TAB><git dir（指定なしは -）>
 #   push<TAB><work tree><TAB><git dir><TAB><push する元の ref（空白区切り）><TAB><push 先（リモート名 / URL / 指定なしは -）>
 #   unresolved<TAB><解決できなかったパス>
+#   ask<TAB>-（フックや検査設定を書き換えうるので、確認を求める）
 targets=$(printf '%s' "$input" | python3 -c '
 import json, os, re, shlex, sys
 
@@ -175,6 +170,42 @@ def assign(k, v, exported):
         maybe_env[k] = v
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+# フックと検査設定。これらに触れるコマンドは、読むだけと分かるもの以外は確認を求める
+PROTECTED = re.compile(r"\.claude(?![A-Za-z0-9_-])|\.gitleaks(?:\.toml|ignore)")
+READONLY = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file", "wc",
+            "diff", "cmp", "sort", "uniq", "cut", "tr", "jq", "yq", "echo", "printf", "pwd", "cd", "pushd", "popd",
+            "true", "false", "test", "[", "which", "type", "shellcheck", "md5sum", "sha256sum", "shasum",
+            "basename", "dirname", "realpath", "readlink", "nl", "column", "tree", "du", "df", "date", "gh"}
+GIT_READONLY = {"diff", "show", "log", "status", "blame", "ls-files", "ls-tree", "grep", "add", "commit", "push",
+                "fetch", "rev-parse", "rev-list", "cat-file", "describe", "shortlog", "branch", "remote", "tag"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+readonly_ok = [True]
+
+def check_readonly(seg):
+    """この文が、作業ツリーのファイルを書き換えない（読むだけ）と分かるか"""
+    for k, t in enumerate(seg):
+        if t in REDIRECTS:
+            nxt = seg[k + 1] if k + 1 < len(seg) else ""
+            if nxt != "/dev/null" and not nxt.isdigit():
+                return False
+    w = [t for t in seg if not ASSIGN.match(t)]
+    if not w:
+        return True
+    cmd0 = os.path.basename(w[0])
+    if cmd0 == "git":
+        i = 1
+        while i < len(w) and w[i].startswith("-"):
+            i += 2 if w[i] in GIT_OPTS_WITH_ARG else 1
+        return i >= len(w) or w[i] in GIT_READONLY
+    if cmd0 == "sed":
+        return not any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--") and "i" in a) for a in w[1:])
+    if cmd0 == "find":
+        return not any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls") for a in w[1:])
+    if cmd0 in SHELLS:
+        return w[1:2] == ["-n"]            # 構文の確認だけ
+    return cmd0 in READONLY
+
 def heredoc_words(line, arith=0):
     """行の中で本当に始まっているヒアドキュメントの終端語を返す（正規表現では判定しない）。
     shlex で字句に分けるので、引用符の中や # コメントの `<<WORD` はヒアドキュメント扱いしない。
@@ -185,8 +216,10 @@ def heredoc_words(line, arith=0):
     try:
         toks = list(lex)
     except ValueError:
-        return [], arith
+        return [], arith, False
     words = []
+    # bash <<EOF や cat <<EOF | sh のように、本文をシェルが実行する
+    runs = any(os.path.basename(t) in SHELLS for t in toks)
     for k, t in enumerate(toks):
         # $(( … )) / (( … )) の中の << は算術の左シフトで、ヒアドキュメントではない
         arith += t.count("((") - t.count("))")
@@ -196,21 +229,28 @@ def heredoc_words(line, arith=0):
             w = w[1:] if dash else w
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", w or ""):
                 words.append((dash, w))
-    return words, arith
+    return words, arith, runs
 
 def strip_heredocs(text):
     """ヒアドキュメント（<<EOF … EOF）の本文を除く。本文はコマンドではないので、
     コミットメッセージ中の `cd …` や `git push` を文として解釈しないようにする"""
-    out, pending, arith = [], [], 0
+    out, pending, arith, runs = [], [], 0, False
     for line in text.split("\n"):
         if pending:
             dash, word = pending[0]
             if (line.lstrip("\t") if dash else line) == word:
                 pending.pop(0)
+                if runs and not pending:
+                    out.append(")")
+                continue
+            if runs:
+                out.append(line)   # シェルが実行する本文は、コマンドとして解析する
             continue
         out.append(line)
         # $(( … )) が複数行にまたがっても、中の << をヒアドキュメントと取り違えないよう、深さは行をまたいで数える
-        pending, arith = heredoc_words(line, arith)
+        pending, arith, runs = heredoc_words(line, arith)
+        if pending and runs:
+            out.append("(")        # 別のシェルで実行されるので、中の cd は外に効かない（サブシェル扱い）
     if pending:
         # 終端語が最後まで現れない（本当はヒアドキュメントではなかった疑い）: 除いた行も検査の保険に回す
         unterminated.append(text)
@@ -227,7 +267,9 @@ KINDS = re.compile(r"\b(commit|push)\b")
 def parse(text, start=None):
     # 改行は文の区切り。改行そのものも残す（# コメントは改行で終わるので、消すと後ろの行まで
     # コメント扱いになり、`# メモ` の次の行の cd / git commit を見落とす）
-    lex = shlex.shlex(strip_heredocs(text).replace("\n", " ;\n"), posix=True, punctuation_chars=True)
+    # 行末の \ による行継続は、実際のシェルと同じく 1 行につなげてから、残りの改行を文の区切りにする
+    body = re.sub(r"\\\n", "", strip_heredocs(text))
+    lex = shlex.shlex(body.replace("\n", " ;\n"), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = list(lex)
     here, seg, stack = (start or cwd), [], []
@@ -258,6 +300,8 @@ def segment(seg, here):
         seg = seg[1:]
     if not seg:
         return here
+    if not check_readonly(seg):
+        readonly_ok[0] = False
     if seg[0] in ("export", "declare", "typeset", "readonly", "local"):
         exported = seg[0] == "export" or any(a.startswith("-") and "x" in a for a in seg[1:])
         for a in seg[1:]:
@@ -416,6 +460,8 @@ if GITWORD.search(rest):
         out.append("commit\t" + cwd + "\t-")
     if not found["push"] and re.search(r"\bpush\b", rest):
         out.append("push\t" + cwd + "\t-\t--branches\t-")
+if PROTECTED.search(cmd) and not readonly_ok[0]:
+    out.append("ask\t-")
 # 決められないパスは、commit / push があるときだけ問題にする（git status などは止めない）
 if not any(o.split("\t", 1)[0] in ("commit", "push", "subst") for o in out):
     out = [o for o in out if not o.startswith("unresolved\t")]
@@ -423,11 +469,9 @@ print("\n".join(dict.fromkeys(out)))
 ') || block "コマンドを解析できなかったため、念のため止めました。"
 [ -z "$targets" ] && allow
 
+# PATH にある gitleaks は使わない（同じ版を名乗る別物を検証できないため）。SHA-256 を確かめて
+# キャッシュした公式バイナリだけを使う
 find_gitleaks() {
-  if command -v gitleaks >/dev/null 2>&1 \
-     && [ "$(gitleaks version 2>/dev/null | sed 's/^v//')" = "$GITLEAKS_VERSION" ]; then
-    echo gitleaks; return 0
-  fi
   local os arch key cache bin tgz
   case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) return 1 ;; esac
   case "$(uname -m)" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; *) return 1 ;; esac
@@ -604,6 +648,7 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
     block "コマンド置換（\$( … ) や \`…\`）の中に git commit / push があり、検査先を決められないため止めました。置換の外に出して実行し直してください。"
   fi
   [ "$kind" = forceadd ] && continue   # commit の検査のときに使う
+  if [ "$kind" = ask ]; then ASK=1; continue; fi
   if [ "$kind" = unresolved ]; then
     block "コマンド中のパス（${dir}）が変数を含んでいて、どこを commit / push するのか決められないため止めました。パスを直接書いて実行し直してください。"
   fi

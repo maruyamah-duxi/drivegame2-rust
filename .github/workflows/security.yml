@@ -121,14 +121,16 @@ jobs:
           else
             BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null) || BASE="$BASE_SHA"
           fi
+          # 前回の残り（キャンセルで後片付けが走らなかった base のディレクトリと worktree の登録）は、
+          # 下でスキップして終わる場合も含めて、最初に消す
+          rm -rf "$RUNNER_TEMP"/osv-base-*
+          git worktree prune
           scan . "$RUNNER_TEMP/osv-head.json"
           # この PR の状態にロックファイル等が無ければ、増えた脆弱性も無いので base は取り出さない
           if [ "$SCAN_RC" -eq 128 ]; then echo "ロックファイルが無いためスキップ"; exit 0; fi
           # 変更前（base）の状態を別ディレクトリに取り出して同じようにスキャンする。
           # ランナーは作業ディレクトリを使い回すので、前回の残り（キャンセルで後片付けが走らなかった
           # ディレクトリと登録）を掃除してから作り、終わったら（キャンセルされても）消す。
-          rm -rf "$RUNNER_TEMP"/osv-base-*
-          git worktree prune
           BASE_DIR="$RUNNER_TEMP/osv-base-$GITHUB_RUN_ID"
           cleanup() { git worktree remove --force "$BASE_DIR" >/dev/null 2>&1; rm -rf "$BASE_DIR"; git worktree prune; }
           trap cleanup EXIT
