@@ -103,6 +103,6 @@ jobs:
           docker run --rm --network=none --user "$(id -u):$(id -g)" \
             -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config \
             -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/semgrep-rules:/rules:ro" -w /src \
-            -e SEMGREP_SEND_METRICS=off \
+            \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
             "$SEMGREP_IMAGE" semgrep "${args[@]}"
