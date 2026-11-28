@@ -1,0 +1,106 @@
+# 静的解析（SAST）。GHAS の Code scanning（CodeQL）の代わり。
+#
+# Semgrep CE（公式イメージを digest で固定）と、Semgrep 公式ルール集（コミットで固定）のうち
+# security ルールだけを使う。ルールは実行時にネットから取らない。
+#   * PR        … この PR で新しく入った問題だけで失敗させる（--baseline-commit）
+#   * main / 週次 … 全体を検査して結果を出すだけ（既存コードの誤検知を潰し終えたら失敗に切り替える）
+# 誤検知は該当行に `# nosemgrep: <rule-id>`（言語のコメント記法で）を付けるか .semgrepignore で除外し、理由を書く。
+#
+# 版を上げるときは、公開から3日以上経った版の digest / コミットに差し替える。
+#   Semgrep 1.187.0（2026-11-24 公開） / semgrep-rules a5ad171（2026-11-10）
+# ルール集は Semgrep Rules License v1.0（社内利用は可）。
+name: SAST
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "47 18 * * 0"   # 毎週月曜 03:47 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sast-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # このリポジトリで使っている言語のルールだけを使う（semgrep-rules のディレクトリ名）
+  SEMGREP_RULES_DIRS: "bash rust yaml/github-actions"
+  SEMGREP_RULES_COMMIT: a5ad1714f00c9f7fde980cab0ea1d6dc6d414fd2
+  # Alpine ベースのイメージは arm64 ランナーでジョブコンテナにできない（JS の Action が動かない）ため、
+  # checkout はランナー上で行い、semgrep だけを docker run で動かす
+  SEMGREP_IMAGE: semgrep/semgrep@sha256:0c8dfa7aa1ca8c50233ec9110e8cd88d139dedd603d56507493f74c6f4b3e062 # 1.187.0
+
+jobs:
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0   # --baseline-commit で PR の差分を比べるため
+          persist-credentials: false   # push しないので、Semgrep に渡すディレクトリに認証情報を残さない
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: semgrep/semgrep-rules
+          ref: ${{ env.SEMGREP_RULES_COMMIT }}
+          path: .semgrep-rules-src
+          persist-credentials: false
+
+      - name: Prepare rules (security only)
+        run: |
+          set -euo pipefail
+          RULES="$RUNNER_TEMP/semgrep-rules"
+          rm -rf "$RULES"; mkdir -p "$RULES"
+          for d in $SEMGREP_RULES_DIRS; do
+            # ルール集の構成が変わった・名前を間違えたときに、検査しないまま成功しないよう止める
+            [ -d ".semgrep-rules-src/$d" ] || { echo "::error::ルール集に $d がありません（SEMGREP_RULES_DIRS / SEMGREP_RULES_COMMIT を確認）"; exit 1; }
+            n=0
+            while IFS= read -r -d '' f; do   # ファイル名は NUL 区切りで受け取る
+              dest="$RULES/${f#.semgrep-rules-src/}"
+              mkdir -p "$(dirname "$dest")"
+              cp "$f" "$dest"
+              n=$((n + 1))
+            done < <(find ".semgrep-rules-src/$d" -path '*/security/*' \( -name '*.yaml' -o -name '*.yml' \) \
+                          ! -name '*.test.yaml' ! -name '*.test.yml' -print0)
+            [ "$n" -gt 0 ] || { echo "::error::$d の security ルールが 0 件です"; exit 1; }
+            echo "  $d: $n 件"
+          done
+          rm -rf .semgrep-rules-src   # 検査対象に混ざらないよう消す
+          echo "使うルール: $(find "$RULES" -type f | wc -l) 件（$SEMGREP_RULES_DIRS）"
+
+      - name: semgrep
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          args=(scan --config /rules --metrics=off)
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # 比較の基準は「checkout した merge commit の 1 つ目の親」＝今のベース。
+            # github.event.pull_request.base.sha はベースが進んでも古いままのことがあり、そのまま使うと
+            # 後からベースに入った他の PR の変更まで「この PR の差分」に数えてしまう
+            # コンフリクトしていて merge commit が作られない PR では、ベースブランチとの分岐点を使う
+            parents=$(git rev-list --parents -n 1 HEAD) || { echo "::error::HEAD の親を取得できませんでした"; exit 1; }
+            if [ "$(echo "$parents" | wc -w)" -eq 3 ]; then
+              BASE=$(git rev-parse HEAD^1) || { echo "::error::merge commit の親を取得できませんでした"; exit 1; }
+            else
+              BASE=$(git merge-base HEAD "origin/$BASE_REF") || { echo "::error::ベースブランチ（origin/$BASE_REF）との分岐点を取得できませんでした"; exit 1; }
+            fi
+            args+=(--error --baseline-commit "$BASE")
+          fi
+          # ルールは手元にあるのでネットワークは使わない。--baseline-commit が git を操作するためソースは書き込み可で渡す。
+          # ランナーと同じユーザーで動かす（root で動かすと、使い回されるワークスペースに root 所有の
+          # ファイルが残り、以降のジョブの checkout が失敗する）。その uid はイメージの passwd に無く
+          # HOME が書けないので、Semgrep の設定・ログ置き場を /tmp に向ける
+          docker run --rm --network=none --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e XDG_CACHE_HOME=/tmp/.cache -e XDG_CONFIG_HOME=/tmp/.config \
+            -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/semgrep-rules:/rules:ro" -w /src \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
+            "$SEMGREP_IMAGE" semgrep "${args[@]}"
