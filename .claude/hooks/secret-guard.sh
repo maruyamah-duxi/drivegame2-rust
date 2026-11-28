@@ -316,14 +316,32 @@ def segment(seg, here):
     if i >= len(seg):
         return here
     sub = seg[i]
+    if sub == "add":
+        # git add -f / --force は .gitignore に一致するファイルも足す。フックの時点ではまだ実行前なので、
+        # 検査用の一時インデックスにも同じファイルを -f で足す（.env を -f で取り込むのを見逃さない）
+        args = seg[i + 1:]
+        if any(a in ("-f", "--force") or (a.startswith("-") and not a.startswith("--") and "f" in a) for a in args):
+            paths, opts_done = [], False
+            for a in args:
+                if a == "--":
+                    opts_done = True
+                elif opts_done or not a.startswith("-"):
+                    paths.append(a)
+            out.append("forceadd\t" + d + "\t" + (gd or "-") + "\t" + "\x1f".join(paths or ["."]))
+        return here
     if sub not in ("commit", "push"):
         return here
     places = [(d, gd)]
     # export されたか分からない GIT_DIR / GIT_WORK_TREE の代入があれば、効いた場合の場所も検査する
-    if maybe_env and not (gd_opt_given or wt_opt_given):
-        e2 = dict(env); e2.update(maybe_env); e2.update(prefix)
-        g2 = resolve(c, e2["GIT_DIR"], e2) if e2.get("GIT_DIR") else ""
-        d2 = resolve(c, e2["GIT_WORK_TREE"], e2) if e2.get("GIT_WORK_TREE") else c
+    # （GIT_DIR と GIT_WORK_TREE は別々に判断する。片方をコマンドラインで指定していても、もう片方は曖昧なまま）
+    gd_maybe = "GIT_DIR" in maybe_env and not gd_opt_given and "GIT_DIR" not in prefix
+    wt_maybe = "GIT_WORK_TREE" in maybe_env and not wt_opt_given and "GIT_WORK_TREE" not in prefix
+    if gd_maybe or wt_maybe:
+        e2 = dict(env)
+        if gd_maybe: e2["GIT_DIR"] = maybe_env["GIT_DIR"]
+        if wt_maybe: e2["GIT_WORK_TREE"] = maybe_env["GIT_WORK_TREE"]
+        g2 = gd if gd_opt_given else (resolve(c, e2["GIT_DIR"], e2) if e2.get("GIT_DIR") else "")
+        d2 = d if wt_opt_given else (resolve(c, e2["GIT_WORK_TREE"], e2) if e2.get("GIT_WORK_TREE") else c)
         if (d2, g2) != (d, gd):
             places.append((d2, g2))
     for pd, pg in places:
@@ -343,7 +361,7 @@ except ValueError:
 # コマンド置換（$( … ) / `…`）の中の git commit / push は、どこで何を対象に実行されるかを
 # 決められない（無引用のヒアドキュメント本文の中の置換も、実際に実行される）ので止める
 SUBST = re.compile(r"\$\([^()]*\bgit\b[^()]*\b(?:commit|push)\b[^()]*\)|`[^`]*\bgit\b[^`]*\b(?:commit|push)\b[^`]*`")
-# 引用付きのヒアドキュメント（<<\x27EOF\x27 / <<"EOF"）の本文は $( … ) が展開されないので見ない
+# 引用付きのヒアドキュメント（<<\x27EOF\x27 / <<"EOF" / <<\\EOF）の本文は $( … ) が展開されないので見ない
 # （git commit -m "$(cat <<\x27EOF\x27 … git push の説明 … EOF)" のようなコミットメッセージで止めない）
 def strip_quoted_heredocs(text):
     res, word = [], None
@@ -353,9 +371,10 @@ def strip_quoted_heredocs(text):
                 word = None
             continue
         res.append(line)
-        m = re.search(r"<<-?\s*([\x27\"])([A-Za-z_][A-Za-z0-9_]*)\1", line)
+        # <<\x27EOF\x27 / <<"EOF" / <<\\EOF はどれも本文を展開しない
+        m = re.search(r"<<-?\s*(?:([\x27\"])([A-Za-z_][A-Za-z0-9_]*)\1|\\([A-Za-z_][A-Za-z0-9_]*))", line)
         if m:
-            word = m.group(2)
+            word = m.group(2) or m.group(3)
     return "\n".join(res)
 if SUBST.search(strip_quoted_heredocs(cmd)):
     out.append("subst\t-")
@@ -414,7 +433,11 @@ deadline_run() {
   if [ -n "${DR_IN:-}" ]; then "$@" <"$DR_IN" & else "$@" & fi
   pid=$!
   # 見張りの出力は捨てる（$( … ) の中で呼ぶので、開いたままだと sleep の終わりまで待たされる）
-  ( sleep "$left"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  # 先に終わったら見張りを止める。見張りの中の sleep も一緒に止める（残すと最大 100 秒残る）
+  ( sleep "$left" & s=$!
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    wait "$s"
+    kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid"; rc=$?
   kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
@@ -471,6 +494,19 @@ scan_commit() {
   tmp_index=$(mktemp "${TMPDIR:-/tmp}/secret-guard-index.XXXXXX") || block "一時ファイルを作れませんでした。"
   if [ -f "$real" ]; then cp "$real" "$tmp_index" || block "インデックスを複製できませんでした（${dir}）。"; else rm -f "$tmp_index"; fi
   (cd "$dir" && GIT_INDEX_FILE="$tmp_index" git add -A) >/dev/null 2>&1 || block "検査用のインデックスを作れませんでした（${dir}）。"
+  # 同じコマンドの git add -f で足されるファイル（.gitignore に一致するものも）を一時インデックスに足す
+  local k d g p
+  while IFS="$(printf '\t')" read -r k d g p; do
+    [ "$k" = forceadd ] && [ "$d" = "$dir" ] || continue
+    local IFS_SAVE=$IFS; IFS="$(printf '\037')"
+    # shellcheck disable=SC2086
+    set -- $p
+    IFS=$IFS_SAVE
+    (cd "$dir" && GIT_INDEX_FILE="$tmp_index" git add -f -- "$@") >/dev/null 2>&1 \
+      || block "git add -f で足すファイル（$*）を検査用のインデックスに載せられなかったため、念のため止めました（${dir}）。"
+  done <<FA
+$targets
+FA
   GIT_INDEX_FILE="$tmp_index" run "$dir" --pre-commit --staged
   rm -f "$tmp_index"; tmp_index=""
 }
@@ -521,6 +557,7 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
   if [ "$kind" = subst ]; then
     block "コマンド置換（\$( … ) や \`…\`）の中に git commit / push があり、検査先を決められないため止めました。置換の外に出して実行し直してください。"
   fi
+  [ "$kind" = forceadd ] && continue   # commit の検査のときに使う
   if [ "$kind" = unresolved ]; then
     block "コマンド中のパス（${dir}）が変数を含んでいて、どこを commit / push するのか決められないため止めました。パスを直接書いて実行し直してください。"
   fi
