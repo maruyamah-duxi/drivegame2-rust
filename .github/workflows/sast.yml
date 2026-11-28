@@ -83,7 +83,11 @@ jobs:
           set -eu
           args="scan --config /rules --metrics=off"
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            args="$args --error --baseline-commit $BASE_SHA"
+            # 比較の基準は「checkout した merge commit の 1 つ目の親」＝今のベース。
+            # github.event.pull_request.base.sha はベースが進んでも古いままのことがあり、そのまま使うと
+            # 後からベースに入った他の PR の変更まで「この PR の差分」に数えてしまう
+            if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]; then BASE=$(git rev-parse HEAD^1); else BASE="$BASE_SHA"; fi
+            args="$args --error --baseline-commit $BASE"
           fi
           # ルールは手元にあるのでネットワークは使わない。--baseline-commit が git を操作するためソースは書き込み可で渡す
           docker run --rm --network=none \
