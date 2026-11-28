@@ -44,10 +44,12 @@ block() { echo "secret-guard: $*" >&2; exit 2; }
 # コマンドを通してしまう。0（通す）と 2（止める）以外で終わったら、止める側に寄せる。
 tmp_index=""
 tmp_out=""
+tmp_cmd=""
 on_exit() {
   local rc=$?
   [ -n "$tmp_index" ] && rm -f "$tmp_index"
   [ -n "$tmp_out" ] && rm -f "$tmp_out"
+  [ -n "$tmp_cmd" ] && rm -f "$tmp_cmd"
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
     echo "secret-guard: フックが異常終了（終了コード ${rc}）したため、念のため止めました。" >&2
     exit 2
@@ -81,6 +83,7 @@ def resolve(base, path, env=None):
     無ければフック自身の環境変数を使う（HOME=/x && cd $HOME をフックの実 HOME と取り違えない）。
     決められない変数（$(...) で作った値、未定義など）が残れば unresolved として止める"""
     vals = dict(os.environ)
+    vals.update(shell_vars)
     vals.update(shell_env)
     vals.update(env or {})
     def sub(m):
@@ -129,13 +132,26 @@ def push_sources(args):
         return [], remote                  # 検査するものが無い
     return (refs or ["HEAD"]), remote
 
-# git の向き先を変える環境変数。コマンドの前の文で export / 代入されたものも、後の git に効くので追う
-# （サブシェルの範囲は区別しない。効きすぎる側に倒れるだけで、検査が漏れる側には倒れない）
+# git の向き先を変える環境変数。コマンドの前の文で export されたものは、後の git に効くので追う。
+# export していない代入（GIT_DIR=x だけの文、-x の無い declare など）は、その変数が既に export
+# されていれば git に効き、されていなければ効かない。フックからはどちらか確かめられないので、
+# 両方の場所を検査する（maybe_env）。$VAR の展開には export の有無に関係なく使う（shell_vars）
 GIT_ENV_KEYS = ("GIT_DIR", "GIT_WORK_TREE")
 shell_env = {k: os.environ[k] for k in GIT_ENV_KEYS if os.environ.get(k)}
+shell_vars, maybe_env = {}, {}
+
+def assign(k, v, exported):
+    shell_vars[k] = v
+    if k not in GIT_ENV_KEYS:
+        return
+    if exported or k in shell_env:   # export 済みの変数への代入は、そのまま git に効く
+        shell_env[k] = v
+        maybe_env.pop(k, None)
+    else:
+        maybe_env[k] = v
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
-def heredoc_words(line):
+def heredoc_words(line, arith=0):
     """行の中で本当に始まっているヒアドキュメントの終端語を返す。
     shlex で字句に分けるので、引用符の中や # コメントの `<<WORD` はヒアドキュメント扱いしない。
     行だけでは字句に分けられない（引用符が次の行へ続くなど）ときは、ヒアドキュメント無しとみなす
@@ -145,8 +161,8 @@ def heredoc_words(line):
     try:
         toks = list(lex)
     except ValueError:
-        return []
-    words, arith = [], 0
+        return [], arith
+    words = []
     for k, t in enumerate(toks):
         # $(( … )) / (( … )) の中の << は算術の左シフトで、ヒアドキュメントではない
         arith += t.count("((") - t.count("))")
@@ -156,12 +172,12 @@ def heredoc_words(line):
             w = w[1:] if dash else w
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", w or ""):
                 words.append((dash, w))
-    return words
+    return words, arith
 
 def strip_heredocs(text):
     """ヒアドキュメント（<<EOF … EOF）の本文を除く。本文はコマンドではないので、
     コミットメッセージ中の `cd …` や `git push` を文として解釈しないようにする"""
-    out, pending = [], []
+    out, pending, arith = [], [], 0
     for line in text.split("\n"):
         if pending:
             dash, word = pending[0]
@@ -169,11 +185,17 @@ def strip_heredocs(text):
                 pending.pop(0)
             continue
         out.append(line)
-        pending = heredoc_words(line)
+        # $(( … )) が複数行にまたがっても、中の << をヒアドキュメントと取り違えないよう、深さは行をまたいで数える
+        pending, arith = heredoc_words(line, arith)
+    if pending:
+        # 終端語が最後まで現れない（本当はヒアドキュメントではなかった疑い）: 除いた行も検査の保険に回す
+        unterminated.append(text)
     return "\n".join(out)
 
 found = {"commit": False, "push": False}
-seen = []   # 解析できた字句（ヒアドキュメント本文と # コメントを除いたもの）
+seen = []   # 検査対象にできなかった文の字句（ヒアドキュメント本文と # コメントは除く）
+unterminated = []
+cdhist = []
 GITWORD = re.compile(r"\bgit\b")
 KINDS = re.compile(r"\b(commit|push)\b")
 
@@ -183,12 +205,15 @@ def parse(text, start=None):
     lex = shlex.shlex(strip_heredocs(text).replace("\n", " ;\n"), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = list(lex)
-    seen.extend(tokens)
     here, seg, stack = (start or cwd), [], []
     for tok in tokens + [";"]:
         if tok and set(tok) <= set(";&|()"):
             if seg:
+                n = len(out)
                 here = segment(seg, here)
+                # 検査対象にできた文（git commit / push）の引数（コミットメッセージなど）は、保険の判定に使わない
+                if len(out) == n:
+                    seen.extend(seg)
             seg = []
             # ( … ) はサブシェル。中の cd は外に効かないので、閉じたら元の場所に戻す
             for ch in tok:
@@ -201,15 +226,23 @@ def parse(text, start=None):
 
 def segment(seg, here):
     # export GIT_DIR=... / declare -x ... / typeset -x ... / unset GIT_DIR は以降の文に効く
+    # if / while / { などの予約語は読み飛ばす（{ cd x; } の cd は実際に効く）
+    while seg and seg[0] in ("{", "}", "!", "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "time"):
+        seg = seg[1:]
+    if not seg:
+        return here
     if seg[0] in ("export", "declare", "typeset", "readonly", "local"):
+        exported = seg[0] == "export" or any(a.startswith("-") and "x" in a for a in seg[1:])
         for a in seg[1:]:
             if ASSIGN.match(a):
                 k, v = a.split("=", 1)
-                shell_env[k] = v
+                assign(k, v, exported)
+            elif exported and a in GIT_ENV_KEYS and a in maybe_env:   # export GIT_DIR（値は前の代入）
+                shell_env[a] = maybe_env.pop(a)
         return here
     if seg[0] == "unset":
         for a in seg[1:]:
-            shell_env.pop(a, None)
+            shell_env.pop(a, None); maybe_env.pop(a, None); shell_vars.pop(a, None)
         return here
     env = dict(shell_env)
     # `env [-i] [-u NAME] K=V ... git ...` は env を読み飛ばす
@@ -227,11 +260,20 @@ def segment(seg, here):
         seg = seg[1:]
     if not seg:
         # 代入だけの文（GIT_DIR=... ;）は以降の文に効く（export 済みの変数なら git にも渡る）
-        shell_env.update(prefix)
+        for k, v in prefix.items():
+            assign(k, v, False)
         return here
     env.update(prefix)
-    if seg[0] in ("cd", "pushd") and len(seg) > 1 and seg[1] != "-":
-        return resolve(here, seg[1], env)
+    if seg[0] in ("cd", "pushd"):
+        args = [a for a in seg[1:] if a not in ("-L", "-P", "-e", "-@")]
+        if not args:
+            return resolve(here, "~", env)                  # 引数なしの cd はホームへ
+        if args[0] == "-":
+            prev = cdhist[-1] if cdhist else here           # cd - は直前の場所へ
+            cdhist.append(here)
+            return prev
+        cdhist.append(here)
+        return resolve(here, args[0], env)
     # bash -c "…" / sh -c "…" は、中のコマンドをその場所から解析する
     if os.path.basename(seg[0]) in ("bash", "sh", "zsh", "dash") and "-c" in seg[1:-1]:
         parse(seg[seg.index("-c", 1) + 1], here)
@@ -264,6 +306,7 @@ def segment(seg, here):
             elif opt.startswith("--git-dir="):
                 gd_opt = opt.split("=", 1)[1]
             i += 1
+    gd_opt_given, wt_opt_given = gd_opt is not None, wt_opt is not None
     if gd_opt is None:
         gd_opt = env.get("GIT_DIR")
     if wt_opt is None:
@@ -273,24 +316,48 @@ def segment(seg, here):
     if i >= len(seg):
         return here
     sub = seg[i]
-    if sub == "commit":
-        out.append("commit\t" + d + "\t" + (gd or "-"))
-        found["commit"] = True
-    elif sub == "push":
-        refs, remote = push_sources(seg[i + 1:])
-        out.append("push\t" + d + "\t" + (gd or "-") + "\t" + (" ".join(refs) or "-") + "\t" + (remote or "-"))
-        found["push"] = True
+    if sub not in ("commit", "push"):
+        return here
+    places = [(d, gd)]
+    # export されたか分からない GIT_DIR / GIT_WORK_TREE の代入があれば、効いた場合の場所も検査する
+    if maybe_env and not (gd_opt_given or wt_opt_given):
+        e2 = dict(env); e2.update(maybe_env); e2.update(prefix)
+        g2 = resolve(c, e2["GIT_DIR"], e2) if e2.get("GIT_DIR") else ""
+        d2 = resolve(c, e2["GIT_WORK_TREE"], e2) if e2.get("GIT_WORK_TREE") else c
+        if (d2, g2) != (d, gd):
+            places.append((d2, g2))
+    for pd, pg in places:
+        if sub == "commit":
+            out.append("commit\t" + pd + "\t" + (pg or "-"))
+        else:
+            refs, remote = push_sources(seg[i + 1:])
+            out.append("push\t" + pd + "\t" + (pg or "-") + "\t" + (" ".join(refs) or "-") + "\t" + (remote or "-"))
+    found[sub] = True
     return here
 
 try:
     parse(cmd)
-    rest = " ".join(seen)
+    rest = " ".join(seen + unterminated)
 except ValueError:
     rest = cmd   # 字句に分けられない: 生のコマンド全体で判断する
 # コマンド置換（$( … ) / `…`）の中の git commit / push は、どこで何を対象に実行されるかを
 # 決められない（無引用のヒアドキュメント本文の中の置換も、実際に実行される）ので止める
 SUBST = re.compile(r"\$\([^()]*\bgit\b[^()]*\b(?:commit|push)\b[^()]*\)|`[^`]*\bgit\b[^`]*\b(?:commit|push)\b[^`]*`")
-if SUBST.search(cmd):
+# 引用付きのヒアドキュメント（<<\x27EOF\x27 / <<"EOF"）の本文は $( … ) が展開されないので見ない
+# （git commit -m "$(cat <<\x27EOF\x27 … git push の説明 … EOF)" のようなコミットメッセージで止めない）
+def strip_quoted_heredocs(text):
+    res, word = [], None
+    for line in text.split("\n"):
+        if word is not None:
+            if line.strip("\t") == word:
+                word = None
+            continue
+        res.append(line)
+        m = re.search(r"<<-?\s*([\x27\"])([A-Za-z_][A-Za-z0-9_]*)\1", line)
+        if m:
+            word = m.group(2)
+    return "\n".join(res)
+if SUBST.search(strip_quoted_heredocs(cmd)):
     out.append("subst\t-")
 # 解析で拾えなかったが commit / push らしき記述はある（解析の失敗、変数経由の git など）:
 # 安全側に倒して、拾えなかった種類ごとに作業ディレクトリでの commit / push として検査する
@@ -343,7 +410,8 @@ tmp_out=$(mktemp "${TMPDIR:-/tmp}/secret-guard-out.XXXXXX") || block "一時フ�
 deadline_run() {
   local left=$((DEADLINE - SECONDS)) pid w rc
   [ "$left" -gt 0 ] || return 124
-  "$@" &
+  # 標準入力を渡すときは DR_IN にファイルを指定する（& で起動すると標準入力は /dev/null になるため）
+  if [ -n "${DR_IN:-}" ]; then "$@" <"$DR_IN" & else "$@" & fi
   pid=$!
   # 見張りの出力は捨てる（$( … ) の中で呼ぶので、開いたままだと sleep の終わりまで待たされる）
   ( sleep "$left"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
@@ -476,4 +544,27 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
 done <<EOF
 $targets
 EOF
+
+# commit するなら、コマンドの文字列そのもの（-m のコミットメッセージ、ヒアドキュメントの本文など）も検査する。
+# ファイルの検査ではコミットメッセージは見えないため
+if printf '%s\n' "$targets" | grep -q '^commit'; then
+  [ -n "$GL" ] || GL=$(find_gitleaks) || block "gitleaks を用意できなかったため、念のため止めました（シークレット検査ができない状態です）。"
+  tmp_cmd=$(mktemp "${TMPDIR:-/tmp}/secret-guard-cmd.XXXXXX") || block "一時ファイルを作れませんでした。"
+  printf '%s' "$input" | python3 -c 'import json,sys; sys.stdout.write((json.load(sys.stdin).get("tool_input") or {}).get("command") or "")' >"$tmp_cmd" \
+    || block "コマンドを取り出せなかったため、念のため止めました。"
+  cfg=()
+  [ -f "${CLAUDE_PROJECT_DIR:-.}/.gitleaks.toml" ] && cfg=(--config "${CLAUDE_PROJECT_DIR:-.}/.gitleaks.toml")
+  DR_IN="$tmp_cmd" deadline_run "$GL" stdin "${cfg[@]+"${cfg[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" >"$tmp_out" 2>&1
+  rc=$?
+  [ "$rc" -eq 124 ] && too_slow "コマンドの文字列"
+  case "$rc" in
+    0) ;;
+    "$LEAK_EXIT")
+      block "コマンドの文字列（コミットメッセージなど）にシークレットらしき値があるため止めました。値を取り除いてから実行し直してください。
+$(grep -E '^(RuleID|Line|Finding):|leaks found' "$tmp_out" | head -20)" ;;
+    *)
+      block "gitleaks の実行に失敗したため、念のため止めました（コマンドの文字列、終了コード ${rc}）。
+$(tail -20 "$tmp_out")" ;;
+  esac
+fi
 exit 0
