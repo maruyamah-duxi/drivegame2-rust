@@ -15,8 +15,9 @@
 # 変数で組み立てたパスなど解決できない場所は、検査できないので止める。
 # 限界: eval や別スクリプトの中で実行される git は追えない（git と commit / push の文字が
 #       コマンド中にあれば、作業ディレクトリでの commit / push として検査はする）。
-#       git のエイリアス（git config alias.ci commit で `git ci` など）や、別名でコピーした git の
-#       実行ファイル（cp /usr/bin/git /tmp/vcs など）も追えない（最後の砦は CI の security.yml）。
+#       別名でコピーした git の実行ファイル（cp /usr/bin/git /tmp/vcs など）も追えない
+#       （最後の砦は CI の security.yml）。git のエイリアスは展開して追い、! で始まるシェルの
+#       エイリアスは中身を追えないので止める。
 # また、フックと検査設定（.claude/settings.json、.claude/hooks/、.gitleaks.toml、.gitleaksignore）を
 # Bash で書き換える・消すコマンドは、確認を求める（settings.json の ask は Edit ツールにしか効かないため）。
 # 除外は .gitleaks.toml / .gitleaksignore（security.yml と共通）。
@@ -51,7 +52,7 @@ tmp_cmd=""
 on_exit() {
   local rc=$?
   [ -n "$tmp_index" ] && rm -f "$tmp_index"
-  [ -n "$tmp_out" ] && rm -f "$tmp_out"
+  [ -n "$tmp_out" ] && rm -f "$tmp_out" "$tmp_out.dirs"
   [ -n "$tmp_cmd" ] && rm -f "$tmp_cmd"
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
     echo "secret-guard: フックが異常終了（終了コード ${rc}）したため、念のため止めました。" >&2
@@ -173,14 +174,15 @@ ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # フックと検査設定。これらに触れるコマンドは、読むだけと分かるもの以外は確認を求める
 PROTECTED = re.compile(r"\.claude(?![A-Za-z0-9_-])|\.gitleaks(?:\.toml|ignore)")
 READONLY = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file", "wc",
-            "diff", "cmp", "sort", "uniq", "cut", "tr", "jq", "yq", "echo", "printf", "pwd", "cd", "pushd", "popd",
+            "diff", "cmp", "uniq", "cut", "tr", "jq", "echo", "printf", "pwd", "cd", "pushd", "popd",
             "true", "false", "test", "[", "which", "type", "shellcheck", "md5sum", "sha256sum", "shasum",
-            "basename", "dirname", "realpath", "readlink", "nl", "column", "tree", "du", "df", "date", "gh"}
+            "basename", "dirname", "realpath", "readlink", "nl", "column", "tree", "du", "df", "date"}
 GIT_READONLY = {"diff", "show", "log", "status", "blame", "ls-files", "ls-tree", "grep", "add", "commit", "push",
                 "fetch", "rev-parse", "rev-list", "cat-file", "describe", "shortlog", "branch", "remote", "tag"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 readonly_ok = [True]
+touches = [False]
 
 def check_readonly(seg):
     """この文が、作業ツリーのファイルを書き換えない（読むだけ）と分かるか"""
@@ -204,7 +206,34 @@ def check_readonly(seg):
         return not any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls") for a in w[1:])
     if cmd0 in SHELLS:
         return w[1:2] == ["-n"]            # 構文の確認だけ
+    if cmd0 == "sort":                     # sort -o は出力先のファイルを書き換える
+        return not any(a == "-o" or a.startswith("--output") or (a.startswith("-") and not a.startswith("--") and "o" in a) for a in w[1:])
+    if cmd0 == "gh":
+        # 見るだけのサブコマンドと、GET の gh api（-X / -f / -F / --input が無いもの）だけ
+        if len(w) >= 3 and w[1] in ("pr", "issue", "run", "repo", "release", "workflow") \
+                and w[2] in ("view", "list", "diff", "checks", "status"):
+            return True
+        if len(w) >= 2 and w[1] == "api":
+            bad = {"-X", "--method", "-f", "-F", "--field", "--raw-field", "--input"}
+            return not any(a in bad or any(a.startswith(b + "=") for b in bad) for a in w[2:])
+        return False
     return cmd0 in READONLY
+
+# よく使う git のサブコマンド（エイリアスの確認を省く）。エイリアスは組み込みの名前を上書きできない
+KNOWN_SUBS = {"commit", "push", "add", "status", "diff", "log", "show", "fetch", "pull", "checkout", "switch",
+              "branch", "merge", "rebase", "reset", "restore", "stash", "tag", "remote", "rev-parse", "rev-list",
+              "config", "init", "clone", "worktree", "cherry-pick", "revert", "rm", "mv", "ls-files", "grep",
+              "blame", "describe", "submodule", "apply", "am", "clean", "notes", "bisect", "reflog", "gc", "fsck"}
+
+def git_alias(where, gitdir, name):
+    """設定済みの git エイリアスの中身。無ければ None"""
+    import subprocess
+    cmd = ["git"] + (["--git-dir", gitdir] if gitdir else []) + ["config", "--get", "alias." + name]
+    try:
+        r = subprocess.run(cmd, cwd=where if os.path.isdir(where) else None, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 def heredoc_words(line, arith=0):
     """行の中で本当に始まっているヒアドキュメントの終端語を返す（正規表現では判定しない）。
@@ -218,8 +247,10 @@ def heredoc_words(line, arith=0):
     except ValueError:
         return [], arith, False
     words = []
-    # bash <<EOF や cat <<EOF | sh のように、本文をシェルが実行する
-    runs = any(os.path.basename(t) in SHELLS for t in toks)
+    # bash <<EOF や cat <<EOF | sh のように、本文をシェルが実行する。
+    # $S <<EOF のように変数でコマンドを呼ぶ場合も、シェルかもしれないので本文を解析する
+    runs = any(os.path.basename(t) in SHELLS for t in toks) or any(
+        t.startswith("$") and (k == 0 or set(toks[k - 1]) <= set(";&|(")) for k, t in enumerate(toks))
     for k, t in enumerate(toks):
         # $(( … )) / (( … )) の中の << は算術の左シフトで、ヒアドキュメントではない
         arith += t.count("((") - t.count("))")
@@ -272,18 +303,23 @@ def parse(text, start=None):
     lex = shlex.shlex(body.replace("\n", " ;\n"), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = list(lex)
-    here, seg, stack = (start or cwd), [], []
+    here, seg, stack, piped = (start or cwd), [], [], False
     for tok in tokens + [";"]:
         if tok and set(tok) <= set(";&|()"):
             if seg:
                 n = len(out)
                 handled[0] = False
+                before = here
                 here = segment(seg, here)
+                # cmd & （バックグラウンド）とパイプラインの各部分はサブシェルで動くので、中の cd は後ろに効かない
+                if piped or tok.rstrip(")") in ("&", "|", "|&"):
+                    here = before
                 # 検査対象にできた文（git commit / push）や、git の他のサブコマンド（git stash push など）の
                 # 引数は、保険の判定に使わない
                 if len(out) == n and not handled[0]:
                     seen.extend(seg)
             seg = []
+            piped = tok.rstrip(")") in ("|", "|&")
             # ( … ) はサブシェル。中の cd は外に効かないので、閉じたら元の場所に戻す
             for ch in tok:
                 if ch == "(":
@@ -302,6 +338,12 @@ def segment(seg, here):
         return here
     if not check_readonly(seg):
         readonly_ok[0] = False
+    # フックや検査設定に触れるか。引用符で分けた名前（.cla""ude）も字句に分けた後なら見える。
+    # 変数（f=.claude; rm -rf $f）は展開してから、今いる場所（cd .claude; rm …）も見る
+    joined = " ".join(seg)
+    expanded = VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2), m.group(0)), joined)
+    if PROTECTED.search(joined) or PROTECTED.search(expanded) or PROTECTED.search(here + "/"):
+        touches[0] = True
     if seg[0] in ("export", "declare", "typeset", "readonly", "local"):
         exported = seg[0] == "export" or any(a.startswith("-") and "x" in a for a in seg[1:])
         for a in seg[1:]:
@@ -360,10 +402,13 @@ def segment(seg, here):
         return here
     # git は先に -C で移動してから、--git-dir / --work-tree と GIT_DIR / GIT_WORK_TREE の
     # 相対パスをその場所から解釈する
-    c, i, gd_opt, wt_opt = here, 1, None, None
+    c, i, gd_opt, wt_opt, cfg = here, 1, None, None, {}
     while i < len(seg) and seg[i].startswith("-"):
         opt = seg[i]
         if opt in GIT_OPTS_WITH_ARG and i + 1 < len(seg):
+            if opt == "-c" and "=" in seg[i + 1]:     # git -c key=value
+                k, v = seg[i + 1].split("=", 1)
+                cfg[k.lower()] = v
             if opt == "-C":
                 c = resolve(c, seg[i + 1], env)
             elif opt == "--work-tree":
@@ -377,6 +422,8 @@ def segment(seg, here):
             elif opt.startswith("--git-dir="):
                 gd_opt = opt.split("=", 1)[1]
             i += 1
+    if wt_opt is None and "core.worktree" in cfg:    # git -c core.worktree=… も作業ツリーを変える
+        wt_opt = cfg["core.worktree"]
     gd_opt_given, wt_opt_given = gd_opt is not None, wt_opt is not None
     if gd_opt is None:
         gd_opt = env.get("GIT_DIR")
@@ -388,6 +435,31 @@ def segment(seg, here):
     if i >= len(seg):
         return here
     sub = seg[i]
+    rest_args = seg[i + 1:]
+    # エイリアス（git -c alias.ci=commit ci、git config alias.ci commit で登録したもの）を展開する。
+    # ! で始まるシェルのエイリアスは中身を追えないので止める
+    for _ in range(5):
+        if sub in KNOWN_SUBS:
+            break
+        val = None
+        for k, v in cfg.items():
+            if k == "alias." + sub.lower():
+                val = v
+        if val is None:
+            val = git_alias(c, gd, sub)
+        if val is None:
+            break
+        if val.lstrip().startswith("!"):
+            out.append("opaque\tgit のエイリアス「" + sub + "」はシェルのコマンドで、中身を追えません")
+            return here
+        try:
+            words = shlex.split(val)
+        except ValueError:
+            words = []
+        if not words:
+            break
+        sub, rest_args = words[0], words[1:] + rest_args
+    seg = seg[:i] + [sub] + rest_args
     if sub == "add":
         # git add -f / --force は .gitignore に一致するファイルも足す。フックの時点ではまだ実行前なので、
         # 検査用の一時インデックスにも同じファイルを -f で足す（.env を -f で取り込むのを見逃さない）
@@ -460,10 +532,10 @@ if GITWORD.search(rest):
         out.append("commit\t" + cwd + "\t-")
     if not found["push"] and re.search(r"\bpush\b", rest):
         out.append("push\t" + cwd + "\t-\t--branches\t-")
-if PROTECTED.search(cmd) and not readonly_ok[0]:
+if (touches[0] or PROTECTED.search(cmd)) and not readonly_ok[0]:
     out.append("ask\t-")
 # 決められないパスは、commit / push があるときだけ問題にする（git status などは止めない）
-if not any(o.split("\t", 1)[0] in ("commit", "push", "subst") for o in out):
+if not any(o.split("\t", 1)[0] in ("commit", "push", "subst", "opaque") for o in out):
     out = [o for o in out if not o.startswith("unresolved\t")]
 print("\n".join(dict.fromkeys(out)))
 ') || block "コマンドを解析できなかったため、念のため止めました。"
@@ -581,7 +653,10 @@ $(printf '%s\n' "$out" | tail -20)" ;;
 
 scan_commit() {
   local dir=$1 real
-  # 未追跡のファイルも含めて「全部 add した状態」を一時インデックスに作り、それをステージ済みとして検査する
+  # まず、いまステージされている内容（実インデックス）をそのまま検査する（ステージ後に作業ツリーから
+  # 消しても、コミットされるのはステージした内容）
+  run "$dir" --pre-commit --staged
+  # 次に、未追跡のファイルも含めて「全部 add した状態」を一時インデックスに作り、それをステージ済みとして検査する
   real=$(cd "$dir" && git rev-parse --path-format=absolute --git-path index) || block "インデックスの場所を取得できませんでした（${dir}）。"
   tmp_index=$(mktemp "${TMPDIR:-/tmp}/secret-guard-index.XXXXXX") || block "一時ファイルを作れませんでした。"
   if [ -f "$real" ]; then cp "$real" "$tmp_index" || block "インデックスを複製できませんでした（${dir}）。"; else rm -f "$tmp_index"; fi
@@ -649,6 +724,7 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
   fi
   [ "$kind" = forceadd ] && continue   # commit の検査のときに使う
   if [ "$kind" = ask ]; then ASK=1; continue; fi
+  [ "$kind" = opaque ] && block "${dir}。commit / push かどうか決められないため止めました。"
   if [ "$kind" = unresolved ]; then
     block "コマンド中のパス（${dir}）が変数を含んでいて、どこを commit / push するのか決められないため止めました。パスを直接書いて実行し直してください。"
   fi
@@ -680,18 +756,23 @@ if printf '%s\n' "$targets" | grep -q '^commit'; then
   tmp_cmd=$(mktemp "${TMPDIR:-/tmp}/secret-guard-cmd.XXXXXX") || block "一時ファイルを作れませんでした。"
   printf '%s' "$input" | python3 -c 'import json,sys; sys.stdout.write((json.load(sys.stdin).get("tool_input") or {}).get("command") or "")' >"$tmp_cmd" \
     || block "コマンドを取り出せなかったため、念のため止めました。"
-  gl_cfg "${CLAUDE_PROJECT_DIR:-$PWD}"
-  DR_IN="$tmp_cmd" deadline_run "$GL" stdin "${GLCFG[@]+"${GLCFG[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" >"$tmp_out" 2>&1
-  rc=$?
-  [ "$rc" -eq 124 ] && too_slow "コマンドの文字列"
-  case "$rc" in
-    0) ;;
-    "$LEAK_EXIT")
-      block "コマンドの文字列（コミットメッセージなど）にシークレットらしき値があるため止めました。値を取り除いてから実行し直してください。
+  # 除外設定は、commit する場所ごとのものを使う（ファイルの検査と合わせる）
+  printf '%s\n' "$targets" | awk -F '\t' '$1 == "commit" { print $2 }' | sort -u >"$tmp_out.dirs"
+  while IFS= read -r cdir; do
+    gl_cfg "$cdir"
+    DR_IN="$tmp_cmd" deadline_run "$GL" stdin "${GLCFG[@]+"${GLCFG[@]}"}" --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" >"$tmp_out" 2>&1
+    rc=$?
+    [ "$rc" -eq 124 ] && too_slow "コマンドの文字列"
+    case "$rc" in
+      0) ;;
+      "$LEAK_EXIT")
+        block "コマンドの文字列（コミットメッセージなど）にシークレットらしき値があるため止めました。値を取り除いてから実行し直してください。
 $(grep -E '^(RuleID|Line|Finding):|leaks found' "$tmp_out" | head -20)" ;;
-    *)
-      block "gitleaks の実行に失敗したため、念のため止めました（コマンドの文字列、終了コード ${rc}）。
+      *)
+        block "gitleaks の実行に失敗したため、念のため止めました（コマンドの文字列、終了コード ${rc}）。
 $(tail -20 "$tmp_out")" ;;
-  esac
+    esac
+  done <"$tmp_out.dirs"
+  rm -f "$tmp_out.dirs"
 fi
 allow
