@@ -196,6 +196,8 @@ def expand(v):
 def assign(k, v, exported):
     v = expand(v)
     shell_vars[k] = v
+    if k in GIT_EXEC_ENV:      # export（または export 済みかもしれない代入）は以降の git に効く
+        exec_env[0] = True
     if k not in GIT_ENV_KEYS:
         return
     if exported or k in shell_env:   # export 済みの変数への代入は、そのまま git に効く
@@ -218,6 +220,7 @@ GIT_EXEC_ENV = {"GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF", "GIT_PAGER", 
                 "GIT_ASKPASS", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 readonly_ok = [True]
+exec_env = [False]
 wrote = [False]
 NON_WRITE = {"export", "unset", "declare", "typeset", "local", "readonly", "mkdir", "cd", "pushd", "popd", "set"}
 touches = [False]
@@ -249,6 +252,17 @@ def may_name_protected(tok):
                     return True
     return False
 
+def writes_by_shell(seg):
+    """リダイレクト（/dev/null と fd の複製以外）かコマンド置換で、何かを書き込みうるか"""
+    if any("`" in t or "$(" in t for t in seg):
+        return True
+    for k, t in enumerate(seg):
+        if t in REDIRECTS:
+            nxt = seg[k + 1] if k + 1 < len(seg) else ""
+            if nxt != "/dev/null" and not ("&" in t and nxt.isdigit()):
+                return True
+    return False
+
 def check_readonly(seg):
     """この文が、作業ツリーのファイルを書き換えない（読むだけ）と分かるか"""
     # コマンド置換（`…` / 引用符の中の $( … )）は中で何でも実行できる
@@ -269,12 +283,14 @@ def check_readonly(seg):
     if any(t.split("=", 1)[0] in GIT_EXEC_ENV for t in seg[:len(seg) - len(w)]):
         return False
     if cmd0 == "git":
+        if exec_env[0]:
+            return False                     # 前の文で GIT_SSH_COMMAND などを設定している
         i = 1
         while i < len(w) and w[i].startswith("-"):
             if w[i] == "-c" or w[i].startswith("--config-env"):
                 return False                 # git -c core.sshCommand=… などでコマンドを実行できる
             i += 2 if w[i] in GIT_OPTS_WITH_ARG else 1
-        if i < len(w) and any(a.startswith(("--upload-pack", "--receive-pack", "--exec", "-u", "--output", "--ext-diff"))
+        if i < len(w) and any(a.startswith(("--upload-pack", "--receive-pack", "--exec", "--output", "--ext-diff"))
                               for a in w[i + 1:]):
             return False                     # fetch --upload-pack=<cmd> などはコマンドを実行・ファイルを書く
         return i >= len(w) or w[i] in GIT_READONLY
@@ -519,6 +535,8 @@ def segment(seg, here):
         text = " ".join(seg)
         if GITWORD.search(text) or seg[0].startswith("$"):
             for kind in dict.fromkeys(KINDS.findall(text)):
+                if kind == "commit" and wrote[0]:
+                    out.append("opaque\t同じコマンドの中で commit より前にファイルを書き換える文があり、書き換え後の内容を検査できません。書き換えと commit を別のコマンドに分けて実行してください")
                 out.append("commit\t" + here + "\t-" if kind == "commit" else "push\t" + here + "\t-\t--branches\t-")
                 found[kind] = True
         return here
@@ -595,6 +613,10 @@ def segment(seg, here):
         touches[0] = True
     # checkout / stash pop などは作業ツリーを書き換える（init は .git を作るだけ、stash list / show は見るだけ）
     if sub not in GIT_READONLY and sub != "init" and not (sub == "stash" and rest_args[:1] in (["list"], ["show"])):
+        wrote[0] = True
+    # git show … > file や git add $(…) のように、リダイレクトやコマンド置換で書き込む場合も
+    # （commit / push 自身のメッセージの "$(cat …)" は除く）
+    if sub not in ("commit", "push") and writes_by_shell(seg):
         wrote[0] = True
     # パスを書かずに作業ツリー全体を書き換える操作は、フックや検査設定も書き換えうる
     if (sub == "clean" and not any(a in ("-n", "--dry-run") or (a.startswith("-") and not a.startswith("--") and "n" in a) for a in rest_args)) \
@@ -675,6 +697,8 @@ if SUBST.search(strip_quoted_heredocs(cmd)):
 # ヒアドキュメント本文と # コメントの中の文字は見ない（コミットメッセージ中の「git push」で誤って止めない）
 if GITWORD.search(rest):
     if not found["commit"] and re.search(r"\bcommit\b", rest):
+        if wrote[0]:
+            out.append("opaque\t同じコマンドの中で commit より前にファイルを書き換える文があり、書き換え後の内容を検査できません。書き換えと commit を別のコマンドに分けて実行してください")
         out.append("commit\t" + cwd + "\t-")
     if not found["push"] and re.search(r"\bpush\b", rest):
         out.append("push\t" + cwd + "\t-\t--branches\t-")
