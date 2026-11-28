@@ -74,6 +74,20 @@ allow() {
   exit 0
 }
 
+# Bash 以外（Write / Edit / MultiEdit / NotebookEdit）から呼ばれたときは、編集するファイルが
+# フックや検査設定なら確認を求める（settings.json の ask ルールに加えた二重の守り）
+tool_name=$(printf '%s' "$input" | sed -nE 's/.*"tool_name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -1)
+if [ -n "$tool_name" ] && [ "$tool_name" != Bash ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    fpath=$(printf '%s' "$input" | python3 -c 'import json,sys; t=json.load(sys.stdin).get("tool_input") or {}; print(t.get("file_path") or t.get("notebook_path") or "")') \
+      || block "フックへの入力を解析できなかったため、念のため止めました。"
+  else
+    fpath=$input
+  fi
+  printf '%s' "$fpath" | grep -Eq '\.claude([^A-Za-z0-9_-]|$)|\.gitleaks(\.toml|ignore)' && ASK=1
+  allow
+fi
+
 # 文字列での絞り込みはしない（git co""mmit や g\it のように引用符・バックスラッシュで語を分けると
 # すり抜けるため）。すべてのコマンドを shlex で字句に分けてから判断する。
 # python3 が無い環境だけは、git と commit / push の文字があれば止め、無ければ通す
@@ -109,6 +123,7 @@ def resolve(base, path, env=None):
     vals.update(shell_vars)
     vals.update(shell_env)
     vals.update(env or {})
+    vals = {k: v for k, v in vals.items() if v is not None}
     def sub(m):
         name = m.group(1) or m.group(2)
         return vals[name] if name in vals else m.group(0)
@@ -197,7 +212,9 @@ def check_readonly(seg):
             nxt = seg[k + 1] if k + 1 < len(seg) else ""
             if nxt != "/dev/null" and not nxt.isdigit():
                 return False
-    w = [t for t in seg if not ASSIGN.match(t)]
+    w = list(seg)
+    while w and ASSIGN.match(w[0]):        # 先頭の環境変数の代入だけを除く（引数の x=y は残す）
+        w = w[1:]
     if not w:
         return True
     cmd0 = os.path.basename(w[0])
@@ -297,6 +314,7 @@ found = {"commit": False, "push": False}
 seen = []   # 検査対象にできなかった文の字句（ヒアドキュメント本文と # コメントは除く）
 unterminated = []
 cdhist = []
+dirstack = []
 handled = [False]
 GITWORD = re.compile(r"\bgit\b")
 KINDS = re.compile(r"\b(commit|push)\b")
@@ -347,7 +365,7 @@ def segment(seg, here):
     # フックや検査設定に触れるか。引用符で分けた名前（.cla""ude）も字句に分けた後なら見える。
     # 変数（f=.claude; rm -rf $f）は展開してから、今いる場所（cd .claude; rm …）も見る
     joined = " ".join(seg)
-    expanded = VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2), m.group(0)), joined)
+    expanded = VAR.sub(lambda m: shell_vars.get(m.group(1) or m.group(2)) or m.group(0), joined)
     if PROTECTED.search(joined) or PROTECTED.search(expanded) or PROTECTED.search(here + "/"):
         touches[0] = True
     if seg[0] in ("export", "declare", "typeset", "readonly", "local"):
@@ -361,7 +379,8 @@ def segment(seg, here):
         return here
     if seg[0] == "unset":
         for a in seg[1:]:
-            shell_env.pop(a, None); maybe_env.pop(a, None); shell_vars.pop(a, None)
+            shell_env.pop(a, None); maybe_env.pop(a, None)
+            shell_vars[a] = None   # フック自身の環境に同じ名前があっても、unset 後は未定義として扱う
         return here
     env = dict(shell_env)
     # `env [-i] [-u NAME] K=V ... git ...` は env を読み飛ばす
@@ -383,7 +402,25 @@ def segment(seg, here):
             assign(k, v, False)
         return here
     env.update(prefix)
-    if seg[0] in ("cd", "pushd"):
+    if seg[0] == "popd":                                    # pushd で積んだ場所へ戻る
+        if dirstack:
+            return dirstack.pop()
+        out.append("unresolved\tpopd")                     # 戻る先が分からない
+        return here
+    if seg[0] == "pushd":
+        args = [a for a in seg[1:] if not a.startswith("-") or a == "-"]
+        if not args:                                        # 引数なしの pushd は直前に積んだ場所と入れ替える
+            if dirstack:
+                top = dirstack.pop(); dirstack.append(here)
+                return top
+            out.append("unresolved\tpushd")
+            return here
+        if args[0].startswith(("+", "-")) and args[0][1:].isdigit():
+            out.append("unresolved\t" + args[0])           # スタックの回転は追わない
+            return here
+        dirstack.append(here)
+        return resolve(here, args[0], env)
+    if seg[0] == "cd":
         args = [a for a in seg[1:] if a not in ("-L", "-P", "-e", "-@")]
         if not args:
             return resolve(here, "~", env)                  # 引数なしの cd はホームへ
@@ -466,6 +503,11 @@ def segment(seg, here):
             break
         sub, rest_args = words[0], words[1:] + rest_args
     seg = seg[:i] + [sub] + rest_args
+    # 展開後の文でも、読むだけか・保護対象に触れるかを判定し直す（git wipe → checkout -- .claude/… など）
+    if not check_readonly(seg):
+        readonly_ok[0] = False
+    if PROTECTED.search(" ".join(seg)):
+        touches[0] = True
     if sub == "add":
         # git add -f / --force は .gitignore に一致するファイルも足す。フックの時点ではまだ実行前なので、
         # 検査用の一時インデックスにも同じファイルを -f で足す（.env を -f で取り込むのを見逃さない）

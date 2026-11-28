@@ -87,7 +87,6 @@ jobs:
       - name: osv-scanner
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BASE_REF: ${{ github.base_ref }}
         run: |
           set +e -uo pipefail   # 終了コードを自分で判定するため -e を外す
