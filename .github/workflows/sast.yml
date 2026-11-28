@@ -90,7 +90,7 @@ jobs:
             # コンフリクトしていて merge commit が作られない PR では、ベースブランチとの分岐点を使う
             parents=$(git rev-list --parents -n 1 HEAD) || { echo "::error::HEAD の親を取得できませんでした"; exit 1; }
             if [ "$(echo "$parents" | wc -w)" -eq 3 ]; then
-              BASE=$(git rev-parse HEAD^1)
+              BASE=$(git rev-parse HEAD^1) || { echo "::error::merge commit の親を取得できませんでした"; exit 1; }
             else
               BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null) || BASE="$BASE_SHA"
             fi
