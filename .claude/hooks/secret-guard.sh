@@ -143,9 +143,11 @@ def heredoc_words(line):
         toks = list(lex)
     except ValueError:
         return []
-    words = []
+    words, arith = [], 0
     for k, t in enumerate(toks):
-        if t == "<<" and k + 1 < len(toks):          # <<< はヒアストリングで別の字句になる
+        # $(( … )) / (( … )) の中の << は算術の左シフトで、ヒアドキュメントではない
+        arith += t.count("((") - t.count("))")
+        if t == "<<" and k + 1 < len(toks) and arith <= 0:   # <<< はヒアストリングで別の字句になる
             w = toks[k + 1]
             dash = w.startswith("-")
             w = w[1:] if dash else w
@@ -256,6 +258,11 @@ try:
     found = parse(cmd)
 except ValueError:
     found = False
+# コマンド置換（$( … ) / `…`）の中の git commit / push は、どこで何を対象に実行されるかを
+# 決められない（無引用のヒアドキュメント本文の中の置換も、実際に実行される）ので止める
+SUBST = re.compile(r"\$\([^()]*\bgit\b[^()]*\b(?:commit|push)\b[^()]*\)|`[^`]*\bgit\b[^`]*\b(?:commit|push)\b[^`]*`")
+if SUBST.search(cmd):
+    out.append("subst\t-")
 # 解析で拾えなかったが commit / push らしき記述はある（bash -c "..." の中など）:
 # 安全側に倒して、作業ディレクトリでの commit / push として検査する
 # （`g=git; $g commit` のように git を変数経由で呼ぶ書き方も、文字が両方あればここで拾う）
@@ -382,6 +389,9 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
   [ "$gitdir" = "-" ] && gitdir=""
   [ "$remote" = "-" ] && remote=""
   [ "$refs" = "-" ] && refs=""
+  if [ "$kind" = subst ]; then
+    block "コマンド置換（\$( … ) や \`…\`）の中に git commit / push があり、検査先を決められないため止めました。置換の外に出して実行し直してください。"
+  fi
   if [ "$kind" = unresolved ]; then
     block "コマンド中のパス（${dir}）が変数を含んでいて、どこを commit / push するのか決められないため止めました。パスを直接書いて実行し直してください。"
   fi
