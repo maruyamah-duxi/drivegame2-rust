@@ -15,6 +15,7 @@
 # 変数で組み立てたパスなど解決できない場所は、検査できないので止める。
 # 限界: eval や別スクリプトの中で実行される git は追えない（git と commit / push の文字が
 #       コマンド中にあれば、作業ディレクトリでの commit / push として検査はする）。
+#       git のエイリアス（git config alias.ci commit で `git ci` など）も追えない。
 # 除外は .gitleaks.toml / .gitleaksignore（security.yml と共通）。
 #
 # gitleaks は版を固定する。PATH にあっても版が違えば使わず、版と SHA-256 を固定した公式バイナリを
@@ -70,9 +71,22 @@ cmd = (data.get("tool_input") or {}).get("command") or ""
 cwd = data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 out = []
 
-def resolve(base, path):
-    p = os.path.expanduser(os.path.expandvars(path))
-    if "$" in p:   # このフックの環境では決まらない変数（コマンド内で後から代入されるものなど）
+VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+def resolve(base, path, env=None):
+    """パスの $VAR と ~ を展開する。コマンドの中で代入・export された値（env / shell_env）を優先し、
+    無ければフック自身の環境変数を使う（HOME=/x && cd $HOME をフックの実 HOME と取り違えない）。
+    決められない変数（$(...) で作った値、未定義など）が残れば unresolved として止める"""
+    vals = dict(os.environ)
+    vals.update(shell_env)
+    vals.update(env or {})
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        return vals[name] if name in vals else m.group(0)
+    p = VAR.sub(sub, path)
+    if p == "~" or p.startswith("~/"):
+        p = vals.get("HOME", "~") + p[1:]
+    if "$" in p or p.startswith("~"):
         out.append("unresolved\t" + path)
     return os.path.normpath(os.path.join(base, p))
 
@@ -87,7 +101,9 @@ def push_sources(args):
         a = args[i]
         if a in ("--delete", "-d"):           # ブランチの削除。何も転送しない
             delete = True
-        elif a in ("--all", "--mirror", "--branches"):
+        elif a == "--mirror":                 # ブランチだけでなくタグ・notes なども全部送る
+            refs.append("--all")
+        elif a in ("--all", "--branches"):
             refs.append("--branches")
         elif a == "--tags":
             refs.append("--tags")
@@ -201,28 +217,28 @@ def segment(seg, here):
         return here, False
     env.update(prefix)
     if seg[0] in ("cd", "pushd") and len(seg) > 1 and seg[1] != "-":
-        return resolve(here, seg[1]), False
+        return resolve(here, seg[1], env), False
     if os.path.basename(seg[0]) != "git":
         return here, False
     d, i = here, 1
-    gd = resolve(here, env["GIT_DIR"]) if "GIT_DIR" in env else ""
+    gd = resolve(here, env["GIT_DIR"], env) if "GIT_DIR" in env else ""
     if "GIT_WORK_TREE" in env:
-        d = resolve(here, env["GIT_WORK_TREE"])
+        d = resolve(here, env["GIT_WORK_TREE"], env)
     while i < len(seg) and seg[i].startswith("-"):
         opt = seg[i]
         if opt in GIT_OPTS_WITH_ARG and i + 1 < len(seg):
             if opt == "-C":
-                d = resolve(d, seg[i + 1])
+                d = resolve(d, seg[i + 1], env)
             elif opt == "--work-tree":
-                d = resolve(d, seg[i + 1])
+                d = resolve(d, seg[i + 1], env)
             elif opt == "--git-dir":
-                gd = resolve(d, seg[i + 1])
+                gd = resolve(d, seg[i + 1], env)
             i += 2
         else:
             if opt.startswith("--work-tree="):
-                d = resolve(d, opt.split("=", 1)[1])
+                d = resolve(d, opt.split("=", 1)[1], env)
             elif opt.startswith("--git-dir="):
-                gd = resolve(d, opt.split("=", 1)[1])
+                gd = resolve(d, opt.split("=", 1)[1], env)
             i += 1
     if i >= len(seg):
         return here, False
@@ -297,6 +313,21 @@ $(printf '%s\n' "$out" | tail -20)" ;;
   esac
 }
 
+scan_dir() {
+  local dir=$1 out rc
+  out=$("$GL" dir --redact --verbose --no-banner --no-color --exit-code "$LEAK_EXIT" "$dir" 2>&1)
+  rc=$?
+  case "$rc" in
+    0) ;;
+    "$LEAK_EXIT")
+      block "シークレットらしき値を検出したため止めました（${dir}）。値を取り除いてから実行し直してください（誤検知なら .gitleaks.toml に理由付きで除外を追加）。
+$(printf '%s\n' "$out" | grep -E '^(RuleID|File|Line|Finding):|leaks found' | head -40)" ;;
+    *)
+      block "gitleaks の実行に失敗したため、念のため止めました（${dir}、終了コード ${rc}）。
+$(printf '%s\n' "$out" | tail -20)" ;;
+  esac
+}
+
 scan_commit() {
   local dir=$1 real
   # 未追跡のファイルも含めて「全部 add した状態」を一時インデックスに作り、それをステージ済みとして検査する
@@ -356,9 +387,15 @@ while IFS="$(printf '\t')" read -r kind dir gitdir refs remote; do
   fi
   # --git-dir / GIT_DIR の指定があれば、以降の git（gitleaks の中の git も）をそのリポジトリに向ける
   if [ -n "$gitdir" ]; then export GIT_DIR="$gitdir" GIT_WORK_TREE="$dir"; else unset GIT_DIR GIT_WORK_TREE; fi
-  # git リポジトリでない場所（git init 前など）は検査するものが無い
-  (cd "$dir" 2>/dev/null && git rev-parse --git-dir) >/dev/null 2>&1 || continue
   [ -n "$GL" ] || GL=$(find_gitleaks) || block "gitleaks を用意できなかったため、念のため止めました（シークレット検査ができない状態です）。"
+  # まだ git リポジトリでない場所（同じコマンドの中で git init する場合など）は、push するものは無いが、
+  # commit なら最初のコミットに入るファイルを、ディレクトリごと検査する
+  if ! (cd "$dir" 2>/dev/null && git rev-parse --git-dir) >/dev/null 2>&1; then
+    [ "$kind" = commit ] || continue
+    [ -d "$dir" ] || block "commit する場所（${dir}）がまだ無く、検査できないため止めました。ディレクトリを作るコマンドと commit するコマンドを分けて実行してください。"
+    scan_dir "$dir"
+    continue
+  fi
   case "$kind" in
     commit) scan_commit "$dir" ;;
     push)   scan_push "$dir" "$refs" "$remote" ;;
