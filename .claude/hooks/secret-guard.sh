@@ -79,10 +79,14 @@ if printf '%s' "$input" | grep -Eq '\.claude/(settings(\.local)?\.json|hooks)|\.
   fi
 fi
 
-# 手早く絞る: git と commit / push の両方を含まないコマンドは対象外
-printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' || allow
-
-command -v python3 >/dev/null 2>&1 || block "python3 が無いため、コマンドを解析できず念のため止めました。"
+# 文字列での絞り込みはしない（git co""mmit や g\it のように引用符・バックスラッシュで語を分けると
+# すり抜けるため）。すべてのコマンドを shlex で字句に分けてから判断する。
+# python3 が無い環境だけは、git と commit / push の文字があれば止め、無ければ通す
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$input" | grep -Eq 'git' && printf '%s' "$input" | grep -Eq '(commit|push)' \
+    && block "python3 が無いため、コマンドを解析できず念のため止めました。"
+  allow
+fi
 
 # コマンドを解析して、検査対象を 1 行 1 件で出す:
 #   commit<TAB><work tree><TAB><git dir（指定なしは -）>
@@ -216,6 +220,7 @@ found = {"commit": False, "push": False}
 seen = []   # 検査対象にできなかった文の字句（ヒアドキュメント本文と # コメントは除く）
 unterminated = []
 cdhist = []
+handled = [False]
 GITWORD = re.compile(r"\bgit\b")
 KINDS = re.compile(r"\b(commit|push)\b")
 
@@ -230,9 +235,11 @@ def parse(text, start=None):
         if tok and set(tok) <= set(";&|()"):
             if seg:
                 n = len(out)
+                handled[0] = False
                 here = segment(seg, here)
-                # 検査対象にできた文（git commit / push）の引数（コミットメッセージなど）は、保険の判定に使わない
-                if len(out) == n:
+                # 検査対象にできた文（git commit / push）や、git の他のサブコマンド（git stash push など）の
+                # 引数は、保険の判定に使わない
+                if len(out) == n and not handled[0]:
                     seen.extend(seg)
             seg = []
             # ( … ) はサブシェル。中の cd は外に効かないので、閉じたら元の場所に戻す
@@ -333,6 +340,7 @@ def segment(seg, here):
         wt_opt = env.get("GIT_WORK_TREE")
     gd = resolve(c, gd_opt, env) if gd_opt else ""
     d = resolve(c, wt_opt, env) if wt_opt else c
+    handled[0] = True   # git の文として解析できた（git stash push などの語を保険の判定に回さない）
     if i >= len(seg):
         return here
     sub = seg[i]
@@ -408,6 +416,9 @@ if GITWORD.search(rest):
         out.append("commit\t" + cwd + "\t-")
     if not found["push"] and re.search(r"\bpush\b", rest):
         out.append("push\t" + cwd + "\t-\t--branches\t-")
+# 決められないパスは、commit / push があるときだけ問題にする（git status などは止めない）
+if not any(o.split("\t", 1)[0] in ("commit", "push", "subst") for o in out):
+    out = [o for o in out if not o.startswith("unresolved\t")]
 print("\n".join(dict.fromkeys(out)))
 ') || block "コマンドを解析できなかったため、念のため止めました。"
 [ -z "$targets" ] && allow
@@ -535,12 +546,10 @@ scan_commit() {
   local k d g p
   while IFS="$(printf '\t')" read -r k d g p; do
     [ "$k" = forceadd ] && [ "$d" = "$dir" ] || continue
-    local IFS_SAVE=$IFS; IFS="$(printf '\037')"
-    # shellcheck disable=SC2086
-    set -- $p
-    IFS=$IFS_SAVE
-    (cd "$dir" && GIT_INDEX_FILE="$tmp_index" git add -f -- "$@") >/dev/null 2>&1 \
-      || block "git add -f で足すファイル（$*）を検査用のインデックスに載せられなかったため、念のため止めました（${dir}）。"
+    local fp=()
+    IFS="$(printf '\037')" read -r -a fp <<<"$p"
+    (cd "$dir" && GIT_INDEX_FILE="$tmp_index" git add -f -- "${fp[@]}") >/dev/null 2>&1 \
+      || block "git add -f で足すファイル（${fp[*]}）を検査用のインデックスに載せられなかったため、念のため止めました（${dir}）。"
   done <<FA
 $targets
 FA
