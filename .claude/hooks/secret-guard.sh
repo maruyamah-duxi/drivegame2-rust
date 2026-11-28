@@ -211,9 +211,11 @@ READONLY = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg
             "diff", "cmp", "uniq", "cut", "tr", "jq", "echo", "printf", "pwd", "cd", "pushd", "popd",
             "true", "false", "test", "[", "which", "type", "shellcheck", "md5sum", "sha256sum", "shasum",
             "basename", "dirname", "realpath", "readlink", "nl", "column", "tree", "du", "df", "date"}
-GIT_READONLY = {"diff", "show", "log", "status", "blame", "ls-files", "ls-tree", "grep", "add", "commit", "push", "init",
+GIT_READONLY = {"diff", "show", "log", "status", "blame", "ls-files", "ls-tree", "grep", "add", "commit", "push",
                 "fetch", "rev-parse", "rev-list", "cat-file", "describe", "shortlog", "branch", "remote", "tag"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+GIT_EXEC_ENV = {"GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+                "GIT_ASKPASS", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
 readonly_ok = [True]
 wrote = [False]
@@ -263,10 +265,18 @@ def check_readonly(seg):
     if not w:
         return True
     cmd0 = os.path.basename(w[0])
+    # 先頭の環境変数で、git にコマンドを実行させるもの（GIT_SSH_COMMAND など）
+    if any(t.split("=", 1)[0] in GIT_EXEC_ENV for t in seg[:len(seg) - len(w)]):
+        return False
     if cmd0 == "git":
         i = 1
         while i < len(w) and w[i].startswith("-"):
+            if w[i] == "-c" or w[i].startswith("--config-env"):
+                return False                 # git -c core.sshCommand=… などでコマンドを実行できる
             i += 2 if w[i] in GIT_OPTS_WITH_ARG else 1
+        if i < len(w) and any(a.startswith(("--upload-pack", "--receive-pack", "--exec", "-u", "--output", "--ext-diff"))
+                              for a in w[i + 1:]):
+            return False                     # fetch --upload-pack=<cmd> などはコマンドを実行・ファイルを書く
         return i >= len(w) or w[i] in GIT_READONLY
     if cmd0 == "sed":
         return not any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--") and "i" in a) for a in w[1:])
@@ -414,7 +424,7 @@ def segment(seg, here):
     # command cd / builtin cd も cd として扱う（command -v は調べるだけ）
     while seg and seg[0] in ("{", "}", "!", "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "time",
                              "command", "builtin"):
-        if seg[0] == "command" and seg[1:2] in (["-v"], ["-V"]):
+        if seg[0] == "command" and len(seg) > 1 and re.fullmatch(r"-p?[vV]p?", seg[1]):
             return here
         seg = seg[1:]
         while seg and seg[0] == "-p":
@@ -424,7 +434,8 @@ def segment(seg, here):
     # 同じコマンドの中で、commit より前にファイルを書き換えうる文があるか（フックは実行前に一度だけ
     # 動くので、後から書き込まれる内容は検査できない）。シェルの -c は中身を別に解析する
     # git の文は下でサブコマンドを見て判断する（コミットメッセージの "$(cat …)" を書き込みと取り違えない）
-    if os.path.basename(seg[0]) != "git" and not check_readonly(seg) and seg[0] not in NON_WRITE \
+    has_subst = any("`" in t or "$(" in t for t in seg)
+    if os.path.basename(seg[0]) != "git" and not check_readonly(seg) and (seg[0] not in NON_WRITE or has_subst) \
             and not (os.path.basename(seg[0]) in SHELLS and "-c" in seg[1:-1]):
         wrote[0] = True
     if not check_readonly(seg):
@@ -499,7 +510,7 @@ def segment(seg, here):
         cdhist.append(here)
         return resolve(here, args[0], env)
     # bash -c "…" / sh -c "…" は、中のコマンドをその場所から解析する
-    if os.path.basename(seg[0]) in ("bash", "sh", "zsh", "dash") and "-c" in seg[1:-1]:
+    if os.path.basename(seg[0]) in SHELLS and "-c" in seg[1:-1]:
         parse(seg[seg.index("-c", 1) + 1], here)
         return here
     if os.path.basename(seg[0]) != "git":
@@ -582,10 +593,11 @@ def segment(seg, here):
         readonly_ok[0] = False
     if PROTECTED.search(" ".join(seg)):
         touches[0] = True
-    if sub not in GIT_READONLY:
-        wrote[0] = True   # checkout / stash pop などは作業ツリーを書き換える
+    # checkout / stash pop などは作業ツリーを書き換える（init は .git を作るだけ、stash list / show は見るだけ）
+    if sub not in GIT_READONLY and sub != "init" and not (sub == "stash" and rest_args[:1] in (["list"], ["show"])):
+        wrote[0] = True
     # パスを書かずに作業ツリー全体を書き換える操作は、フックや検査設定も書き換えうる
-    if sub == "clean" \
+    if (sub == "clean" and not any(a in ("-n", "--dry-run") or (a.startswith("-") and not a.startswith("--") and "n" in a) for a in rest_args)) \
             or (sub == "reset" and any(a in ("--hard", "--merge", "--keep") for a in rest_args)) \
             or (sub == "stash" and rest_args[:1] in (["pop"], ["apply"])) \
             or (sub in ("checkout", "restore", "switch") and any(a in (".", ":/", "-f", "--force") for a in rest_args)):
